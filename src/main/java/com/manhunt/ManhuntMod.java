@@ -7,7 +7,8 @@ import net.fabricmc.api.DedicatedServerModInitializer;
 import net.fabricmc.fabric.api.command.v1.CommandRegistrationCallback;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents;
 import net.fabricmc.fabric.api.event.player.UseItemCallback;
-import net.minecraft.advancement.Advancement;
+import net.minecraft.entity.boss.dragon.EnderDragonEntity;
+import net.minecraft.entity.boss.dragon.EnderDragonFight;
 import net.minecraft.entity.player.PlayerEntity;
 import net.minecraft.item.ItemStack;
 import net.minecraft.item.Items;
@@ -19,7 +20,6 @@ import net.minecraft.server.world.ServerWorld;
 import net.minecraft.text.LiteralText;
 import net.minecraft.util.Formatting;
 import net.minecraft.util.Hand;
-import net.minecraft.util.Identifier;
 import net.minecraft.util.TypedActionResult;
 import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.registry.RegistryKey;
@@ -43,6 +43,11 @@ public class ManhuntMod implements DedicatedServerModInitializer {
     private static int gracePeriod = 0;
     private static int deadZoneRadius = 20;
     private static int graceTicksLeft = 0;
+
+    // Ender Dragon win detection via the End's dragon fight (works for ANY kill — melee, beds, etc.,
+    // unlike the kill_dragon advancement which needs a player credited with the kill).
+    private static boolean dragonKilledBaseline = false; // was the dragon already dead in this world at game start?
+    private static boolean sawLiveDragon = false;        // have we observed a live dragon in the End this game?
 
     // Map<runnerUUID, Map<dimensionId, portalBlockPos>> — portal positions per dimension
     private static final Map<UUID, Map<String, BlockPos>> runnerPortalPositions = new HashMap<>();
@@ -88,6 +93,13 @@ public class ManhuntMod implements DedicatedServerModInitializer {
                     gameRunning = true;
                     graceTicksLeft = gracePeriod * 20;
                     eliminatedRunners.clear();
+
+                    // Baseline the dragon state: if it's already dead in this world, a "became dead" edge
+                    // won't fire, so we fall back to detecting an alive->dead transition this game instead.
+                    ServerWorld endAtStart = server.getWorld(World.END);
+                    EnderDragonFight fightAtStart = endAtStart != null ? endAtStart.getEnderDragonFight() : null;
+                    dragonKilledBaseline = fightAtStart != null && fightAtStart.hasPreviouslyKilled();
+                    sawLiveDragon = false;
 
                     // Freeze hunters
                     for (UUID id : hunters) {
@@ -295,20 +307,31 @@ public class ManhuntMod implements DedicatedServerModInitializer {
                 return;
             }
 
-            // Dragon kill -> runner wins. Checked for ALL runners (even eliminated ones) and BEFORE the
-            // elimination/win logic below: killing the dragon often kills the runner too, and the
-            // kill_dragon advancement persists across death/respawn, so this must take priority over a
-            // "hunters win by elimination" that would otherwise fire on the same or next tick.
-            Advancement dragonAdv = server.getAdvancementLoader().get(new Identifier("minecraft", "end/kill_dragon"));
-            if (dragonAdv != null) {
-                for (UUID runnerId : runners) {
-                    ServerPlayerEntity runner = server.getPlayerManager().getPlayer(runnerId);
-                    if (runner == null) continue;
-                    if (runner.getAdvancementTracker().getProgress(dragonAdv).isDone()) {
-                        broadcast(server, "§b§l" + runner.getName().getString() + " killed the dragon! Runner wins!");
-                        endGame(server, null);
-                        return;
-                    }
+            // Dragon kill -> runner wins. Detected via the End's dragon fight, so it works for ANY kill
+            // method (melee, bed/respawn-anchor explosions, etc.) — the kill_dragon advancement only fires
+            // when a player is credited with the kill, which bed-kills don't do. Checked BEFORE the
+            // elimination logic below, since killing the dragon often kills the runner in the same instant.
+            ServerWorld end = server.getWorld(World.END);
+            EnderDragonFight fight = end != null ? end.getEnderDragonFight() : null;
+            if (fight != null) {
+                boolean dragonAliveNow = false;
+                for (EnderDragonEntity d : end.getAliveEnderDragons()) {
+                    if (d.isAlive()) { dragonAliveNow = true; break; }
+                }
+                if (dragonAliveNow) sawLiveDragon = true;
+
+                // Win when the dragon dies this game: either the fight's kill flag flips from the start
+                // baseline (normal first kill), or a dragon we saw alive this game is now gone with the
+                // fight marked killed (a re-kill in a world where it had already been killed before).
+                boolean firstKillThisGame = !dragonKilledBaseline && fight.hasPreviouslyKilled();
+                boolean reKillThisGame = sawLiveDragon && !dragonAliveNow && fight.hasPreviouslyKilled();
+                if (firstKillThisGame || reKillThisGame) {
+                    // Team game: the dragon dying is a win for the runner side as a whole.
+                    ServerPlayerEntity credited = nearestRunnerInEnd(server, end);
+                    String prefix = credited != null ? credited.getName().getString() + " killed the dragon! " : "The dragon is dead! ";
+                    broadcast(server, "§b§l" + prefix + "Runners win!");
+                    endGame(server, null);
+                    return;
                 }
             }
 
@@ -458,6 +481,8 @@ public class ManhuntMod implements DedicatedServerModInitializer {
         runnerLastDimension.clear();
         runnerLastPos.clear();
         hunterTarget.clear();
+        dragonKilledBaseline = false;
+        sawLiveDragon = false;
     }
 
     // Set a player to survival and send them to their spawn point (bed if set, else world spawn).
@@ -557,6 +582,29 @@ public class ManhuntMod implements DedicatedServerModInitializer {
         // Offline: fall back to the stored profile name if available.
         com.mojang.authlib.GameProfile profile = server.getUserCache().getByUuid(id);
         return profile != null ? profile.getName() : "A runner";
+    }
+
+    // The in-play runner closest to the dragon, used only to name who gets credited for the kill.
+    private ServerPlayerEntity nearestRunnerInEnd(MinecraftServer server, ServerWorld end) {
+        ServerPlayerEntity best = null;
+        double bestDist = Double.MAX_VALUE;
+        for (UUID id : runners) {
+            if (eliminatedRunners.contains(id)) continue;
+            ServerPlayerEntity r = server.getPlayerManager().getPlayer(id);
+            if (r == null || r.world != end) continue;
+            // Distance to (0,?,0) — the dragon fights around the central exit portal.
+            double dx = r.getX(), dz = r.getZ();
+            double dist = dx * dx + dz * dz;
+            if (dist < bestDist) { bestDist = dist; best = r; }
+        }
+        if (best != null) return best;
+        // Fallback: any in-play runner at all.
+        for (UUID id : runners) {
+            if (eliminatedRunners.contains(id)) continue;
+            ServerPlayerEntity r = server.getPlayerManager().getPlayer(id);
+            if (r != null) return r;
+        }
+        return null;
     }
 
     // Eliminate a runner who just died: respawn them off the death screen (NOT /kill), then spectator.

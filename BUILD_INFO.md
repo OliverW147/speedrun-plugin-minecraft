@@ -100,10 +100,10 @@ All player name arguments support **tab autocomplete**.
 - **Dead zone**: Within a configurable XZ radius of the runner, the compass spins and shows "<runner> is nearby!" — prevents exact pinpointing.
 - **Cross-dimension**: If the tracked runner is in another dimension, the compass points at the runner's **last known position in the hunter's dimension** (if the runner has ever been there). If the tracked runner has **never** visited the hunter's current dimension, the compass **spins** and shows "<runner> is in another dimension!". Visited-dimension history is tracked per runner.
 - **Multiple runners — elimination, not instant win**: When a runner dies (or disconnects), they are **eliminated**, not game-over. They are put into **spectator** (via a normal respawn — never `/kill`) and continuously kept in the **dimension of the lowest-index (first-assigned) alive runner**, with a free camera, until the game ends. The game continues until **all** runners are eliminated.
-- **Win conditions**:
+- **Win conditions** (manhunt is a team game — runners win/lose together):
   - **All** runners eliminated (dead/disconnected) → "Hunters win!"
-  - A runner kills the Ender Dragon → "Runner wins!"
-  - **All hunters disconnect** → "Runner(s) win!"
+  - The Ender Dragon is killed by **any** means → "Runners win!" (see dragon note below)
+  - **All hunters disconnect** → "Runners win!"
   - `/manhunt stop` → manual end
   - On any end, eliminated runners are restored to **survival at their spawn point**.
 - **Disconnect = death**: A runner who logs off mid-game is treated as eliminated.
@@ -117,7 +117,7 @@ All player name arguments support **tab autocomplete**.
 - `Text.of()` does not exist in 1.16.1 — must use `new LiteralText(String)`.
 - `ServerEntityCombatEvents` and `ServerPlayerEvents` don't exist in fabric-api 0.18 — death detection uses tick-based `player.isDead()` polling instead.
 - `broadcastChatMessage` in 1.16.1 requires 3 args: `(Text, MessageType, UUID)`.
-- Dragon kill detected via `minecraft:end/kill_dragon` advancement tracker.
+- Dragon kill is detected via the **End's `EnderDragonFight`** (`ServerWorld.getEnderDragonFight()`), NOT the `kill_dragon` advancement. The advancement (`Free the End`) only fires when a *player is credited with the killing blow* — **bed/respawn-anchor explosion kills do not credit a player**, so advancement-based detection misses them. Instead we watch the fight: win when `hasPreviouslyKilled()` flips from the game-start baseline, or when a dragon seen alive this game disappears with the fight marked killed (covers re-kills after a crystal respawn). This works for melee, beds, command kills — anything.
 - Compass tracking uses lodestone NBT (`LodestonePos`, `LodestoneDimension`, `LodestoneTracked=false`) — works in Nether and End.
 - Right-click toggle uses `UseItemCallback` (`fabric-events-interaction-v0`). The 2-arg `TypedActionResult.success(T, boolean)` is **unmapped** in this yarn build — use `TypedActionResult.consume(stack)` to swallow the click instead.
 - Eliminating a runner uses `PlayerManager.respawnPlayer(player, false)` to clear the death screen, then `setGameMode(SPECTATOR)` — deliberately **not** `/kill`. The returned (new) player entity must be used after respawn.
