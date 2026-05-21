@@ -288,16 +288,20 @@ public class ManhuntMod implements DedicatedServerModInitializer {
                 return;
             }
 
-            // Dragon kill by any in-play (non-eliminated) runner -> runner wins.
-            for (UUID runnerId : runners) {
-                if (eliminatedRunners.contains(runnerId)) continue;
-                ServerPlayerEntity runner = server.getPlayerManager().getPlayer(runnerId);
-                if (runner == null) continue;
-                Advancement dragonAdv = server.getAdvancementLoader().get(new Identifier("minecraft", "end/kill_dragon"));
-                if (dragonAdv != null && runner.getAdvancementTracker().getProgress(dragonAdv).isDone()) {
-                    broadcast(server, "§b§l" + runner.getName().getString() + " killed the dragon! Runner wins!");
-                    endGame(server, null);
-                    return;
+            // Dragon kill -> runner wins. Checked for ALL runners (even eliminated ones) and BEFORE the
+            // elimination/win logic below: killing the dragon often kills the runner too, and the
+            // kill_dragon advancement persists across death/respawn, so this must take priority over a
+            // "hunters win by elimination" that would otherwise fire on the same or next tick.
+            Advancement dragonAdv = server.getAdvancementLoader().get(new Identifier("minecraft", "end/kill_dragon"));
+            if (dragonAdv != null) {
+                for (UUID runnerId : runners) {
+                    ServerPlayerEntity runner = server.getPlayerManager().getPlayer(runnerId);
+                    if (runner == null) continue;
+                    if (runner.getAdvancementTracker().getProgress(dragonAdv).isDone()) {
+                        broadcast(server, "§b§l" + runner.getName().getString() + " killed the dragon! Runner wins!");
+                        endGame(server, null);
+                        return;
+                    }
                 }
             }
 
@@ -629,7 +633,7 @@ public class ManhuntMod implements DedicatedServerModInitializer {
 
         String actionBar;
         if (!sameDim) {
-            actionBar = "§7" + runnerName + " is in another dimension!" + (portalPos != null ? " §8(last seen here marked)" : "");
+            actionBar = "§7" + runnerName + " is in another dimension!" + (portalPos != null ? " (tracking portal)" : "");
         } else if (inDeadZone) {
             actionBar = "§e" + runnerName + " is nearby!";
         } else {
