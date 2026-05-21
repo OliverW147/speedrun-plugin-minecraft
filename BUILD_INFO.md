@@ -20,16 +20,28 @@ Gradle 8.8 distribution is stored at: `D:\manhunt-build\gradle-dist\gradle-8.8\`
 
 ## Building
 
+There is **no** Gradle wrapper (`gradlew.bat`) in this project — use the bundled Gradle 8.8
+distribution directly, and point `JAVA_HOME` at the Adoptium JDK.
+
 ```powershell
 cd D:\manhunt-build
-.\gradlew.bat jar
+$env:JAVA_HOME = "C:\Program Files\Eclipse Adoptium\jdk-21.0.8.9-hotspot"
+& "D:\manhunt-build\gradle-dist\gradle-8.8\bin\gradle.bat" clean build --offline
 ```
 
-Output jar: `build\libs\manhunt-1.0.0.jar`
+**Use `clean build`, not `jar`.** Two reasons:
+- This is a Fabric/loom project — the deployable jar is produced by the `remapJar` task (which
+  `build` runs). The plain `jar` task only makes the *unmapped* dev jar in `build\devlibs\` and does
+  **not** produce the server-ready jar.
+- Incremental builds can go stale: `gradle jar` may report "UP-TO-DATE" and keep old compiled
+  classes even after source edits. `clean` forces a real recompile.
+
+Output jar (the single file you deploy): `build\libs\manhunt-1.0.0.jar`
+(`build\devlibs\manhunt-1.0.0-dev.jar` is an intermediate loom artifact — never deploy it.)
 
 To deploy to server:
 ```powershell
-Copy-Item "build\libs\manhunt-1.0.0.jar" "D:\Minecraft Server\mods\manhunt-1.0.0.jar" -Force
+Copy-Item "build\libs\manhunt-1.0.0.jar" "D:\server\mods\manhunt-1.0.0.jar" -Force
 ```
 
 Then restart the Minecraft server.
@@ -51,7 +63,7 @@ The server already has `fabric-api-0.18.0+build.387-1.16.1.jar` installed — th
 
 ## Server Mod Folder
 
-Location: `D:\Minecraft Server\mods\`
+Location: `D:\server\mods\`
 
 Required mods:
 - `fabric-api-0.18.0+build.387-1.16.1.jar` (already present)
