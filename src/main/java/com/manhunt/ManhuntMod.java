@@ -50,6 +50,11 @@ public class ManhuntMod implements DedicatedServerModInitializer {
     private static final Map<UUID, String> runnerLastDimension = new HashMap<>();
     // Last known BlockPos per runner (from previous tick), used to capture departure position on dim change
     private static final Map<UUID, BlockPos> runnerLastPos = new HashMap<>();
+    // Server tick at which a runner was respawned-as-eliminated. We must NOT cross-dimension teleport a
+    // player on the same tick they were respawned — doing so corrupts chunk-ticket tracking and crashes
+    // the server tick (NPE in ChunkTicketManager.updateCameraPosition). Wait a few ticks for it to settle.
+    private static final Map<UUID, Integer> eliminationTick = new HashMap<>();
+    private static final int RESPAWN_SETTLE_TICKS = 5;
 
     // Per-hunter tracked runner. Absent (or value not in `runners`) = track nearest runner (default).
     // Toggled by right-clicking the compass, which cycles: nearest -> runner0 -> runner1 -> ... -> nearest.
@@ -151,8 +156,8 @@ public class ManhuntMod implements DedicatedServerModInitializer {
                         return 0;
                     }
                     ServerPlayerEntity self = (ServerPlayerEntity) senderEntity;
-                    if (runners.contains(self.getUuid())) {
-                        ctx.getSource().sendFeedback(new LiteralText("§cRunners don't get a tracker compass."), false);
+                    if (!hunters.contains(self.getUuid())) {
+                        ctx.getSource().sendFeedback(new LiteralText("§cOnly hunters get a tracker compass."), false);
                         return 0;
                     }
                     removeAllManhuntCompasses(self);
@@ -180,6 +185,7 @@ public class ManhuntMod implements DedicatedServerModInitializer {
                     UUID id = target.getUuid();
                     runners.remove(id);
                     eliminatedRunners.remove(id);
+                    eliminationTick.remove(id);
                     hunterTarget.remove(id);
                     hunters.add(id);
                     // If they were a spectating (eliminated) runner, put them back into play as a hunter.
@@ -210,6 +216,7 @@ public class ManhuntMod implements DedicatedServerModInitializer {
                     UUID id = target.getUuid();
                     hunters.remove(id);
                     eliminatedRunners.remove(id); // re-added runner is back in play
+                    eliminationTick.remove(id);
                     runners.add(id);
                     removeAllManhuntCompasses(target); // runners don't carry a tracker
                     if (target.interactionManager.getGameMode() == GameMode.SPECTATOR) {
@@ -337,11 +344,17 @@ public class ManhuntMod implements DedicatedServerModInitializer {
                     if (dead.interactionManager.getGameMode() != GameMode.SPECTATOR) {
                         dead.setGameMode(GameMode.SPECTATOR); // e.g. after reconnect
                     }
-                    if (!dead.world.getRegistryKey().equals(anchorDim)) {
-                        ServerWorld w = server.getWorld(anchorDim);
-                        if (w != null) {
-                            dead.teleport(w, anchor.getX(), anchor.getY(), anchor.getZ(), dead.yaw, dead.pitch);
-                        }
+                    if (dead.world.getRegistryKey().equals(anchorDim)) continue; // already in the right dimension
+
+                    // Don't teleport while a respawn or a prior teleport is still settling — a cross-dimension
+                    // teleport in that window corrupts chunk-ticket tracking and crashes the server tick.
+                    Integer elimTick = eliminationTick.get(id);
+                    if (elimTick != null && server.getTicks() - elimTick < RESPAWN_SETTLE_TICKS) continue;
+                    if (dead.isInTeleportationState()) continue;
+
+                    ServerWorld w = server.getWorld(anchorDim);
+                    if (w != null) {
+                        dead.teleport(w, anchor.getX(), anchor.getY(), anchor.getZ(), dead.yaw, dead.pitch);
                     }
                 }
             }
@@ -371,6 +384,11 @@ public class ManhuntMod implements DedicatedServerModInitializer {
                 visited.put(currentDim, runner.getBlockPos());
                 runnerLastDimension.put(runnerId, currentDim);
                 runnerLastPos.put(runnerId, runner.getBlockPos());
+            }
+
+            // Strip tracker compasses from anyone who isn't a hunter (picked up off the ground, etc.).
+            for (ServerPlayerEntity p : server.getPlayerManager().getPlayerList()) {
+                if (!hunters.contains(p.getUuid())) removeAllManhuntCompasses(p);
             }
 
             // Update each hunter's compass to point at their resolved (alive) target.
@@ -434,6 +452,7 @@ public class ManhuntMod implements DedicatedServerModInitializer {
         hunters.clear();
         runners.clear();
         eliminatedRunners.clear();
+        eliminationTick.clear();
         pendingCompassRestore.clear();
         runnerPortalPositions.clear();
         runnerLastDimension.clear();
@@ -454,6 +473,10 @@ public class ManhuntMod implements DedicatedServerModInitializer {
             targetWorld = server.getOverworld();
             spawnPos = targetWorld.getSpawnPos();
         }
+        // A player eliminated this same tick was just respawned at their spawn point already; teleporting
+        // again mid-teleport would corrupt chunk-ticket state. Only move them if they're elsewhere and settled.
+        if (player.isInTeleportationState()) return;
+        if (player.world.getRegistryKey().equals(targetWorld.getRegistryKey())) return;
         player.teleport(targetWorld, spawnPos.getX() + 0.5, spawnPos.getY(), spawnPos.getZ() + 0.5, player.yaw, player.pitch);
     }
 
@@ -537,12 +560,15 @@ public class ManhuntMod implements DedicatedServerModInitializer {
     }
 
     // Eliminate a runner who just died: respawn them off the death screen (NOT /kill), then spectator.
+    // We record the respawn tick so the dimension-lock teleport waits for the respawn to settle (a
+    // same-tick cross-dimension teleport corrupts chunk-ticket state and crashes the server tick).
     private void eliminateRunner(MinecraftServer server, ServerPlayerEntity runner) {
         UUID id = runner.getUuid();
         eliminatedRunners.add(id);
         broadcast(server, "§c§l" + runner.getName().getString() + " was caught!");
         ServerPlayerEntity respawned = server.getPlayerManager().respawnPlayer(runner, false);
         respawned.setGameMode(GameMode.SPECTATOR);
+        eliminationTick.put(id, server.getTicks());
     }
 
     // Resolve which runner a hunter's compass should track this tick.
