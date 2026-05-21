@@ -581,31 +581,24 @@ public class ManhuntMod implements DedicatedServerModInitializer {
 
         UUID current = hunterTarget.get(hunter.getUuid());
         UUID next;
-        String label;
         if (current == null) {
             // nearest -> first runner
             next = ordered.get(0).getUuid();
-            label = ordered.get(0).getName().getString();
         } else {
             int idx = -1;
             for (int i = 0; i < ordered.size(); i++) {
                 if (ordered.get(i).getUuid().equals(current)) { idx = i; break; }
             }
-            if (idx < 0 || idx == ordered.size() - 1) {
-                next = null; // wrap back to nearest after the last runner (or if current target vanished)
-                label = null;
-            } else {
-                next = ordered.get(idx + 1).getUuid();
-                label = ordered.get(idx + 1).getName().getString();
-            }
+            // wrap back to nearest after the last runner (or if current target vanished)
+            next = (idx < 0 || idx == ordered.size() - 1) ? null : ordered.get(idx + 1).getUuid();
         }
 
+        // No feedback message here: the compass name + action bar are refreshed next tick (<50ms)
+        // by updateCompass, which would immediately overwrite any popup shown here.
         if (next == null) {
             hunterTarget.remove(hunter.getUuid());
-            hunter.sendMessage(new LiteralText("§6Tracking: §enearest runner"), true);
         } else {
             hunterTarget.put(hunter.getUuid(), next);
-            hunter.sendMessage(new LiteralText("§6Tracking: §e" + label), true);
         }
     }
 
