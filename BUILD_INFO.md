@@ -80,10 +80,11 @@ All player name arguments support **tab autocomplete**.
 ## Features
 
 - **Grace period**: Hunters are frozen at game start for a configurable duration. Countdown titles shown at 10, 5, 4, 3, 2, 1 seconds.
-- **Tracking compass**: Given to each hunter on start. Uses lodestone NBT to point at the nearest runner in real-time (updates every second).
+- **Tracking compass**: Given to each hunter on start. Uses lodestone NBT to point at a runner in real-time (updates every second). By default it tracks the **nearest** runner.
+- **Togglable target (multi-runner)**: Each hunter **right-clicks** their compass to cycle which runner it tracks: `nearest → runner₁ → runner₂ → … → nearest` (runners ordered alphabetically). The choice is **per hunter** — each hunter tracks independently. The compass renames itself to `Tracker: <name>` (or `<name> (nearest)`) and the action bar names the tracked runner. If the tracked runner leaves the game, that hunter's compass reverts to nearest automatically.
 - **Compass restored on death**: If a hunter dies, their compass is automatically restored when they respawn.
-- **Dead zone**: Within a configurable XZ radius of the runner, the compass goes blank and shows "Runner is nearby!" — prevents exact pinpointing.
-- **Cross-dimension**: When runner is in a different dimension, compass spins randomly (no portal pointing) and shows "Runner is in another dimension!".
+- **Dead zone**: Within a configurable XZ radius of the runner, the compass spins and shows "<runner> is nearby!" — prevents exact pinpointing.
+- **Cross-dimension**: If the tracked runner is in another dimension, the compass points at the runner's **last known position in the hunter's dimension** (if the runner has ever been there). If the tracked runner has **never** visited the hunter's current dimension, the compass **spins** and shows "<runner> is in another dimension!". Visited-dimension history is tracked per runner.
 - **Win conditions**:
   - Runner dies → "Hunters win!"
   - Runner kills the Ender Dragon → "Runner wins!"

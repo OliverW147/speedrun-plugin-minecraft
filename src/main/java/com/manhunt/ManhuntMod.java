@@ -6,7 +6,9 @@ import com.mojang.brigadier.suggestion.SuggestionProvider;
 import net.fabricmc.api.DedicatedServerModInitializer;
 import net.fabricmc.fabric.api.command.v1.CommandRegistrationCallback;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents;
+import net.fabricmc.fabric.api.event.player.UseItemCallback;
 import net.minecraft.advancement.Advancement;
+import net.minecraft.entity.player.PlayerEntity;
 import net.minecraft.item.ItemStack;
 import net.minecraft.item.Items;
 import net.minecraft.nbt.CompoundTag;
@@ -15,8 +17,11 @@ import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.network.ServerPlayerEntity;
 import net.minecraft.text.LiteralText;
 import net.minecraft.util.Formatting;
+import net.minecraft.util.Hand;
 import net.minecraft.util.Identifier;
+import net.minecraft.util.TypedActionResult;
 import net.minecraft.util.math.BlockPos;
+import net.minecraft.world.World;
 
 import java.util.*;
 
@@ -38,6 +43,10 @@ public class ManhuntMod implements DedicatedServerModInitializer {
     private static final Map<UUID, String> runnerLastDimension = new HashMap<>();
     // Last known BlockPos per runner (from previous tick), used to capture departure position on dim change
     private static final Map<UUID, BlockPos> runnerLastPos = new HashMap<>();
+
+    // Per-hunter tracked runner. Absent (or value not in `runners`) = track nearest runner (default).
+    // Toggled by right-clicking the compass, which cycles: nearest -> runner0 -> runner1 -> ... -> nearest.
+    private static final Map<UUID, UUID> hunterTarget = new HashMap<>();
 
     private static final SuggestionProvider<net.minecraft.server.command.ServerCommandSource> ONLINE_PLAYERS =
         (ctx, builder) -> {
@@ -164,6 +173,21 @@ public class ManhuntMod implements DedicatedServerModInitializer {
             );
         });
 
+        // Right-click the tracker compass to cycle which runner it tracks.
+        UseItemCallback.EVENT.register((player, world, hand) -> {
+            ItemStack stack = player.getStackInHand(hand);
+            if (world.isClient || !gameRunning) return TypedActionResult.pass(stack);
+            if (!(player instanceof ServerPlayerEntity)) return TypedActionResult.pass(stack);
+            if (!isManhuntCompass(stack)) return TypedActionResult.pass(stack);
+            ServerPlayerEntity hunter = (ServerPlayerEntity) player;
+            if (!hunters.contains(hunter.getUuid())) return TypedActionResult.pass(stack);
+
+            cycleTarget(hunter);
+            // Consume so the click doesn't also count as a normal item use; keeps the stack in hand
+            // without triggering the client swing/use packet that success() would.
+            return TypedActionResult.consume(stack);
+        });
+
         ServerTickEvents.END_SERVER_TICK.register(server -> {
             if (!gameRunning) return;
 
@@ -223,28 +247,28 @@ public class ManhuntMod implements DedicatedServerModInitializer {
                 }
             }
 
-            // Track runner dimension changes to record portal positions
+            // Record where each runner has been, per dimension.
+            // runnerPortalPositions.get(runner).get(dim) = most recent position that runner was seen at in `dim`.
+            // Its presence for a dimension means "this runner has visited that dimension" — which is what the
+            // compass uses to decide whether to point (visited) or spin (never visited).
             for (UUID runnerId : runners) {
                 ServerPlayerEntity runner = server.getPlayerManager().getPlayer(runnerId);
                 if (runner == null) continue;
                 String currentDim = runner.world.getRegistryKey().getValue().toString();
                 String lastDim = runnerLastDimension.get(runnerId);
+                Map<String, BlockPos> visited = runnerPortalPositions.computeIfAbsent(runnerId, k -> new HashMap<>());
+
                 if (lastDim != null && !lastDim.equals(currentDim)) {
-                    // Runner just changed dimension.
-                    // Record arrival pos in new dim (portal in runnerDim side).
-                    // Also record that the runner was last seen in lastDim — stored under lastDim key so hunters
-                    // in lastDim can point to where runner exited.
-                    Map<String, BlockPos> portals = runnerPortalPositions.computeIfAbsent(runnerId, k -> new HashMap<>());
-                    portals.put(currentDim, runner.getBlockPos());
-                    // departure pos stored in pending map, applied next tick when we still have the old pos
-                    // Actually we already lost the old pos — store current as best approximation for lastDim too
-                    // (arrival in currentDim ≈ portal in currentDim; departure from lastDim is unknown here)
-                    // The departure pos was captured last tick — use runnerLastPortalDeparturePos
+                    // Runner just changed dimension: pin the departure point in the dimension they left,
+                    // so a hunter still in that dimension points at the portal/exit the runner used.
                     BlockPos departurePos = runnerLastPos.get(runnerId);
-                    if (departurePos != null) {
-                        portals.put(lastDim, departurePos);
-                    }
+                    if (departurePos != null) visited.put(lastDim, departurePos);
                 }
+
+                // Always refresh the runner's current location in their current dimension. This both seeds
+                // the runner's starting dimension (which never fires a change event) and keeps the
+                // last-known position fresh while they remain in a dimension.
+                visited.put(currentDim, runner.getBlockPos());
                 runnerLastDimension.put(runnerId, currentDim);
                 runnerLastPos.put(runnerId, runner.getBlockPos());
             }
@@ -254,20 +278,9 @@ public class ManhuntMod implements DedicatedServerModInitializer {
                 ServerPlayerEntity hunter = server.getPlayerManager().getPlayer(hunterId);
                 if (hunter == null) continue;
 
-                ServerPlayerEntity nearestRunner = null;
-                double nearestDist = Double.MAX_VALUE;
-                for (UUID runnerId : runners) {
-                    ServerPlayerEntity runner = server.getPlayerManager().getPlayer(runnerId);
-                    if (runner == null) continue;
-                    double dist = hunter.squaredDistanceTo(runner);
-                    if (dist < nearestDist) {
-                        nearestDist = dist;
-                        nearestRunner = runner;
-                    }
-                }
-
-                if (nearestRunner == null) continue;
-                updateCompass(hunter, nearestRunner);
+                ServerPlayerEntity targetRunner = resolveTarget(server, hunterId);
+                if (targetRunner == null) continue;
+                updateCompass(hunter, targetRunner);
             }
         });
 
@@ -327,12 +340,12 @@ public class ManhuntMod implements DedicatedServerModInitializer {
         runnerPortalPositions.clear();
         runnerLastDimension.clear();
         runnerLastPos.clear();
+        hunterTarget.clear();
     }
 
     private void removeAllManhuntCompasses(ServerPlayerEntity player) {
         for (int i = 0; i < player.inventory.size(); i++) {
-            ItemStack s = player.inventory.getStack(i);
-            if (s.getItem() == Items.COMPASS && s.hasTag() && s.getTag().contains("manhunt")) {
+            if (isManhuntCompass(player.inventory.getStack(i))) {
                 player.inventory.removeStack(i);
                 i--; // adjust index after removal
             }
@@ -349,10 +362,13 @@ public class ManhuntMod implements DedicatedServerModInitializer {
 
     private boolean hasCompass(ServerPlayerEntity player) {
         for (int i = 0; i < player.inventory.size(); i++) {
-            ItemStack s = player.inventory.getStack(i);
-            if (s.getItem() == Items.COMPASS && s.hasTag() && s.getTag().contains("manhunt")) return true;
+            if (isManhuntCompass(player.inventory.getStack(i))) return true;
         }
         return false;
+    }
+
+    private static boolean isManhuntCompass(ItemStack s) {
+        return s.getItem() == Items.COMPASS && s.hasTag() && s.getTag().contains("manhunt");
     }
 
     private void giveCompassTo(ServerPlayerEntity hunter) {
@@ -361,6 +377,84 @@ public class ManhuntMod implements DedicatedServerModInitializer {
         tag.putBoolean("manhunt", true);
         compass.setCustomName(new LiteralText("§6Runner Tracker").formatted(Formatting.ITALIC));
         hunter.inventory.insertStack(compass);
+    }
+
+    // Ordered, stable list of currently-online runners (sorted by name for a predictable cycle order).
+    private List<ServerPlayerEntity> onlineRunners(MinecraftServer server) {
+        List<ServerPlayerEntity> list = new ArrayList<>();
+        for (UUID id : runners) {
+            ServerPlayerEntity p = server.getPlayerManager().getPlayer(id);
+            if (p != null) list.add(p);
+        }
+        list.sort(Comparator.comparing(p -> p.getName().getString().toLowerCase()));
+        return list;
+    }
+
+    // Resolve which runner a hunter's compass should track this tick.
+    // Honors an explicit target if that runner is still online; otherwise falls back to nearest
+    // (and clears a stale target so the compass name reverts to "nearest").
+    private ServerPlayerEntity resolveTarget(MinecraftServer server, UUID hunterId) {
+        ServerPlayerEntity hunter = server.getPlayerManager().getPlayer(hunterId);
+        if (hunter == null) return null;
+        UUID targetId = hunterTarget.get(hunterId);
+        if (targetId != null) {
+            ServerPlayerEntity target = server.getPlayerManager().getPlayer(targetId);
+            if (target != null && runners.contains(targetId)) return target;
+            hunterTarget.remove(hunterId); // target left the game — revert to nearest
+        }
+        return getNearestRunner(server, hunter);
+    }
+
+    private ServerPlayerEntity getNearestRunner(MinecraftServer server, ServerPlayerEntity hunter) {
+        ServerPlayerEntity nearest = null;
+        double nearestDist = Double.MAX_VALUE;
+        for (UUID runnerId : runners) {
+            ServerPlayerEntity runner = server.getPlayerManager().getPlayer(runnerId);
+            if (runner == null) continue;
+            double dist = hunter.squaredDistanceTo(runner);
+            if (dist < nearestDist) {
+                nearestDist = dist;
+                nearest = runner;
+            }
+        }
+        return nearest;
+    }
+
+    // Advance this hunter's compass target one step: nearest -> runner0 -> runner1 -> ... -> nearest.
+    private void cycleTarget(ServerPlayerEntity hunter) {
+        MinecraftServer server = hunter.getServer();
+        if (server == null) return;
+        List<ServerPlayerEntity> ordered = onlineRunners(server);
+        if (ordered.isEmpty()) return;
+
+        UUID current = hunterTarget.get(hunter.getUuid());
+        UUID next;
+        String label;
+        if (current == null) {
+            // nearest -> first runner
+            next = ordered.get(0).getUuid();
+            label = ordered.get(0).getName().getString();
+        } else {
+            int idx = -1;
+            for (int i = 0; i < ordered.size(); i++) {
+                if (ordered.get(i).getUuid().equals(current)) { idx = i; break; }
+            }
+            if (idx < 0 || idx == ordered.size() - 1) {
+                next = null; // wrap back to nearest after the last runner (or if current target vanished)
+                label = null;
+            } else {
+                next = ordered.get(idx + 1).getUuid();
+                label = ordered.get(idx + 1).getName().getString();
+            }
+        }
+
+        if (next == null) {
+            hunterTarget.remove(hunter.getUuid());
+            hunter.sendMessage(new LiteralText("§6Tracking: §enearest runner"), true);
+        } else {
+            hunterTarget.put(hunter.getUuid(), next);
+            hunter.sendMessage(new LiteralText("§6Tracking: §e" + label), true);
+        }
     }
 
     private void updateCompass(ServerPlayerEntity hunter, ServerPlayerEntity runner) {
@@ -374,37 +468,33 @@ public class ManhuntMod implements DedicatedServerModInitializer {
         double xzDist = Math.sqrt(dx * dx + dz * dz);
         boolean inDeadZone = sameDim && xzDist <= deadZoneRadius;
 
-        // Find portal position in hunter's dimension that runner used to enter their current dim
-        // i.e. the last position recorded when runner arrived in runnerDim (which is the portal in runnerDim)
-        // For the hunter's compass to point at the portal on their side, we want the portal pos in hunterDim
-        // That's the position runner was at when they LEFT hunterDim (entered another dim)
+        // Cross-dimension: look up the runner's last-known position in the HUNTER's dimension.
+        // If absent, the tracked runner has never been to this dimension -> the compass will spin.
         BlockPos portalPos = null;
         if (!sameDim) {
-            Map<String, BlockPos> portals = runnerPortalPositions.get(runner.getUuid());
-            if (portals != null) {
-                // The portal on hunter's side is where runner was when they last arrived in runnerDim from hunterDim.
-                // We stored arrival position in runnerDim — to get the hunter-side portal we need the
-                // position stored for hunterDim (where runner arrived when coming into hunterDim, or left from).
-                // Simpler: store departure pos. We stored arrival in currentDim on dim change.
-                // So portals.get(runnerDim) = where runner arrived in runnerDim = the portal in runnerDim.
-                // portals.get(hunterDim) = where runner arrived in hunterDim = portal in hunterDim (hunter's side).
-                portalPos = portals.get(hunterDim);
-            }
+            Map<String, BlockPos> visited = runnerPortalPositions.get(runner.getUuid());
+            if (visited != null) portalPos = visited.get(hunterDim);
         }
+
+        boolean locked = hunterTarget.containsKey(hunter.getUuid());
+        String runnerName = runner.getName().getString();
+        // What the compass is tracking, shown both as the item name and (when relevant) on the action bar.
+        String trackingLabel = locked ? runnerName : runnerName + " §7(nearest)";
 
         String actionBar;
         if (!sameDim) {
-            actionBar = portalPos != null ? "§7Runner is in another dimension! (portal marked)" : "§7Runner is in another dimension!";
+            actionBar = "§7" + runnerName + " is in another dimension!" + (portalPos != null ? " §8(last seen here marked)" : "");
         } else if (inDeadZone) {
-            actionBar = "§eRunner is nearby!";
+            actionBar = "§e" + runnerName + " is nearby!";
         } else {
             actionBar = "";
         }
 
         for (int i = 0; i < hunter.inventory.size(); i++) {
             ItemStack stack = hunter.inventory.getStack(i);
-            if (stack.getItem() != Items.COMPASS || !stack.hasTag() || !stack.getTag().contains("manhunt")) continue;
+            if (!isManhuntCompass(stack)) continue;
             CompoundTag tag = stack.getOrCreateTag();
+            stack.setCustomName(new LiteralText("§6Tracker: §e" + trackingLabel).formatted(Formatting.ITALIC));
 
             if (inDeadZone) {
                 // Point at a nonexistent dimension so the compass spins rather than pointing to spawn
@@ -414,7 +504,7 @@ public class ManhuntMod implements DedicatedServerModInitializer {
                 tag.putString("LodestoneDimension", "manhunt:void");
                 tag.putBoolean("LodestoneTracked", false);
             } else if (!sameDim && portalPos != null) {
-                // Point at runner's portal in hunter's dimension
+                // Runner is in another dim but has been to this one — point at their last-known spot here
                 CompoundTag lodestonePos = new CompoundTag();
                 lodestonePos.putInt("X", portalPos.getX());
                 lodestonePos.putInt("Y", portalPos.getY());
@@ -423,7 +513,7 @@ public class ManhuntMod implements DedicatedServerModInitializer {
                 tag.putString("LodestoneDimension", hunterDim);
                 tag.putBoolean("LodestoneTracked", false);
             } else if (!sameDim) {
-                // No portal recorded yet — spin
+                // Tracked runner has never visited the hunter's dimension — spin
                 CompoundTag fakePos = new CompoundTag();
                 fakePos.putInt("X", 0); fakePos.putInt("Y", 0); fakePos.putInt("Z", 0);
                 tag.put("LodestonePos", fakePos);
