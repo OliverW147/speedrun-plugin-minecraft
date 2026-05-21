@@ -15,12 +15,15 @@ import net.minecraft.nbt.CompoundTag;
 import net.minecraft.network.MessageType;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.network.ServerPlayerEntity;
+import net.minecraft.server.world.ServerWorld;
 import net.minecraft.text.LiteralText;
 import net.minecraft.util.Formatting;
 import net.minecraft.util.Hand;
 import net.minecraft.util.Identifier;
 import net.minecraft.util.TypedActionResult;
 import net.minecraft.util.math.BlockPos;
+import net.minecraft.util.registry.RegistryKey;
+import net.minecraft.world.GameMode;
 import net.minecraft.world.World;
 
 import java.util.*;
@@ -30,8 +33,12 @@ import static net.minecraft.server.command.CommandManager.literal;
 
 public class ManhuntMod implements DedicatedServerModInitializer {
 
-    private static final Set<UUID> hunters = new HashSet<>();
-    private static final Set<UUID> runners = new HashSet<>();
+    // LinkedHashSet for stable insertion order — "lowest-index alive runner" relies on this order.
+    private static final Set<UUID> hunters = new LinkedHashSet<>();
+    private static final Set<UUID> runners = new LinkedHashSet<>();
+    // Runners who have died or disconnected. They remain in `runners` but are out of play:
+    // forced to spectator (no /kill) and locked to a living runner's dimension until the game ends.
+    private static final Set<UUID> eliminatedRunners = new LinkedHashSet<>();
     private static boolean gameRunning = false;
     private static int gracePeriod = 0;
     private static int deadZoneRadius = 20;
@@ -75,6 +82,7 @@ public class ManhuntMod implements DedicatedServerModInitializer {
                     MinecraftServer server = ctx.getSource().getMinecraftServer();
                     gameRunning = true;
                     graceTicksLeft = gracePeriod * 20;
+                    eliminatedRunners.clear();
 
                     // Freeze hunters
                     for (UUID id : hunters) {
@@ -82,8 +90,25 @@ public class ManhuntMod implements DedicatedServerModInitializer {
                         if (h != null) h.setVelocity(0, 0, 0);
                     }
 
+                    // Make sure runners start in survival (e.g. if a prior game left someone spectating).
+                    for (UUID id : runners) {
+                        ServerPlayerEntity r = server.getPlayerManager().getPlayer(id);
+                        if (r != null && r.interactionManager.getGameMode() == GameMode.SPECTATOR) {
+                            r.setGameMode(GameMode.SURVIVAL);
+                        }
+                    }
+
                     broadcast(server, "§6Manhunt starting! Hunters are frozen for §e" + gracePeriod + " §6seconds...");
                     giveCompasses(server);
+
+                    // Tell hunters how to use their tracker compass.
+                    for (UUID id : hunters) {
+                        ServerPlayerEntity h = server.getPlayerManager().getPlayer(id);
+                        if (h != null) {
+                            h.sendMessage(new LiteralText("§6You got a §eRunner Tracker§6 compass."), false);
+                            h.sendMessage(new LiteralText("§7Right-click it to switch which runner you track, or use §f/manhunt compass§7 to get a new one."), false);
+                        }
+                    }
                     return 1;
                 }))
                 .then(literal("stop").executes(ctx -> {
@@ -120,14 +145,19 @@ public class ManhuntMod implements DedicatedServerModInitializer {
                         ctx.getSource().sendFeedback(new LiteralText("§cNo game running."), false);
                         return 0;
                     }
-                    MinecraftServer server = ctx.getSource().getMinecraftServer();
-                    for (UUID id : hunters) {
-                        ServerPlayerEntity h = server.getPlayerManager().getPlayer(id);
-                        if (h == null) continue;
-                        removeAllManhuntCompasses(h);
-                        giveCompassTo(h);
+                    net.minecraft.entity.Entity senderEntity = ctx.getSource().getEntity();
+                    if (!(senderEntity instanceof ServerPlayerEntity)) {
+                        ctx.getSource().sendFeedback(new LiteralText("§cThis must be run by a player."), false);
+                        return 0;
                     }
-                    ctx.getSource().sendFeedback(new LiteralText("§aGave compass to all hunters."), false);
+                    ServerPlayerEntity self = (ServerPlayerEntity) senderEntity;
+                    if (runners.contains(self.getUuid())) {
+                        ctx.getSource().sendFeedback(new LiteralText("§cRunners don't get a tracker compass."), false);
+                        return 0;
+                    }
+                    removeAllManhuntCompasses(self);
+                    giveCompassTo(self);
+                    ctx.getSource().sendFeedback(new LiteralText("§aHere's your tracker compass."), false);
                     return 1;
                 }))
                 .then(literal("setrange")
@@ -147,10 +177,23 @@ public class ManhuntMod implements DedicatedServerModInitializer {
                         ctx.getSource().sendFeedback(new LiteralText("§cPlayer not found: " + name), false);
                         return 0;
                     }
-                    runners.remove(target.getUuid());
-                    hunters.add(target.getUuid());
+                    UUID id = target.getUuid();
+                    runners.remove(id);
+                    eliminatedRunners.remove(id);
+                    hunterTarget.remove(id);
+                    hunters.add(id);
+                    // If they were a spectating (eliminated) runner, put them back into play as a hunter.
+                    if (target.interactionManager.getGameMode() == GameMode.SPECTATOR) {
+                        target.setGameMode(GameMode.SURVIVAL);
+                    }
                     ctx.getSource().sendFeedback(new LiteralText("§e" + name + " §ais now a hunter."), false);
                     target.sendMessage(new LiteralText("§aYou are now a §ehunter§a!"), false);
+                    // Mid-game: equip and brief them immediately.
+                    if (gameRunning) {
+                        removeAllManhuntCompasses(target);
+                        giveCompassTo(target);
+                        target.sendMessage(new LiteralText("§7Right-click the compass to switch which runner you track, or use §f/manhunt compass§7."), false);
+                    }
                     return 1;
                 }))
             );
@@ -164,8 +207,21 @@ public class ManhuntMod implements DedicatedServerModInitializer {
                         ctx.getSource().sendFeedback(new LiteralText("§cPlayer not found: " + name), false);
                         return 0;
                     }
-                    hunters.remove(target.getUuid());
-                    runners.add(target.getUuid());
+                    UUID id = target.getUuid();
+                    hunters.remove(id);
+                    eliminatedRunners.remove(id); // re-added runner is back in play
+                    runners.add(id);
+                    removeAllManhuntCompasses(target); // runners don't carry a tracker
+                    if (target.interactionManager.getGameMode() == GameMode.SPECTATOR) {
+                        target.setGameMode(GameMode.SURVIVAL);
+                    }
+                    // Seed dimension tracking so the compass logic knows where this runner is right away.
+                    if (gameRunning) {
+                        String dim = target.world.getRegistryKey().getValue().toString();
+                        runnerPortalPositions.computeIfAbsent(id, k -> new HashMap<>()).put(dim, target.getBlockPos());
+                        runnerLastDimension.put(id, dim);
+                        runnerLastPos.put(id, target.getBlockPos());
+                    }
                     ctx.getSource().sendFeedback(new LiteralText("§b" + name + " §ais now the runner."), false);
                     target.sendMessage(new LiteralText("§aYou are now the §bspeedrunner§a! Good luck!"), false);
                     return 1;
@@ -223,20 +279,18 @@ public class ManhuntMod implements DedicatedServerModInitializer {
                 return;
             }
 
-            // Check win conditions every 20 ticks
-            if (server.getTicks() % 20 != 0) return;
+            // --- Everything below runs EVERY tick (no 20-tick gating) for responsiveness. ---
 
-            // Check if runner is dead (all runners offline counts as hunters win for simplicity)
-            boolean allRunnersGone = true;
-            for (UUID id : runners) {
-                if (server.getPlayerManager().getPlayer(id) != null) {
-                    allRunnersGone = false;
-                    break;
-                }
+            // Win: all hunters disconnected -> runners win. (Only meaningful if hunters were assigned.)
+            if (!hunters.isEmpty() && noHunterOnline(server)) {
+                broadcast(server, "§b§lAll hunters left! Runner(s) win!");
+                endGame(server, null);
+                return;
             }
 
-            // Check dragon kill via advancement
+            // Dragon kill by any in-play (non-eliminated) runner -> runner wins.
             for (UUID runnerId : runners) {
+                if (eliminatedRunners.contains(runnerId)) continue;
                 ServerPlayerEntity runner = server.getPlayerManager().getPlayer(runnerId);
                 if (runner == null) continue;
                 Advancement dragonAdv = server.getAdvancementLoader().get(new Identifier("minecraft", "end/kill_dragon"));
@@ -247,11 +301,52 @@ public class ManhuntMod implements DedicatedServerModInitializer {
                 }
             }
 
-            // Record where each runner has been, per dimension.
+            // Detect runner elimination: death (on the death screen) or disconnect. Eliminated runners
+            // become spectators (via a normal respawn, never /kill) and are out of play.
+            for (UUID id : new ArrayList<>(runners)) {
+                if (eliminatedRunners.contains(id)) continue;
+                ServerPlayerEntity runner = server.getPlayerManager().getPlayer(id);
+                if (runner == null) {
+                    // Disconnected mid-game = treated as dead.
+                    eliminatedRunners.add(id);
+                    broadcast(server, "§c§l" + nameOf(server, id) + " disconnected — eliminated!");
+                } else if (runner.isDead()) {
+                    eliminateRunner(server, runner);
+                }
+            }
+
+            // Win: every runner eliminated -> hunters win. (Only if runners were assigned.)
+            if (!runners.isEmpty() && eliminatedRunners.containsAll(runners)) {
+                broadcast(server, "§c§lAll runners caught! Hunters win!");
+                endGame(server, null);
+                return;
+            }
+
+            // Keep eliminated (online) runners as spectators, locked to the lowest-index alive runner's dimension.
+            ServerPlayerEntity anchor = lowestIndexAliveRunner(server);
+            if (anchor != null) {
+                RegistryKey<World> anchorDim = anchor.world.getRegistryKey();
+                for (UUID id : eliminatedRunners) {
+                    ServerPlayerEntity dead = server.getPlayerManager().getPlayer(id);
+                    if (dead == null) continue;
+                    if (dead.interactionManager.getGameMode() != GameMode.SPECTATOR) {
+                        dead.setGameMode(GameMode.SPECTATOR); // e.g. after reconnect
+                    }
+                    if (!dead.world.getRegistryKey().equals(anchorDim)) {
+                        ServerWorld w = server.getWorld(anchorDim);
+                        if (w != null) {
+                            dead.teleport(w, anchor.getX(), anchor.getY(), anchor.getZ(), dead.yaw, dead.pitch);
+                        }
+                    }
+                }
+            }
+
+            // Record where each in-play runner has been, per dimension.
             // runnerPortalPositions.get(runner).get(dim) = most recent position that runner was seen at in `dim`.
-            // Its presence for a dimension means "this runner has visited that dimension" — which is what the
+            // Its presence for a dimension means "this runner has visited that dimension" — which the
             // compass uses to decide whether to point (visited) or spin (never visited).
             for (UUID runnerId : runners) {
+                if (eliminatedRunners.contains(runnerId)) continue;
                 ServerPlayerEntity runner = server.getPlayerManager().getPlayer(runnerId);
                 if (runner == null) continue;
                 String currentDim = runner.world.getRegistryKey().getValue().toString();
@@ -273,7 +368,7 @@ public class ManhuntMod implements DedicatedServerModInitializer {
                 runnerLastPos.put(runnerId, runner.getBlockPos());
             }
 
-            // Update compasses
+            // Update each hunter's compass to point at their resolved (alive) target.
             for (UUID hunterId : hunters) {
                 ServerPlayerEntity hunter = server.getPlayerManager().getPlayer(hunterId);
                 if (hunter == null) continue;
@@ -282,31 +377,16 @@ public class ManhuntMod implements DedicatedServerModInitializer {
                 if (targetRunner == null) continue;
                 updateCompass(hunter, targetRunner);
             }
-        });
 
-        ServerTickEvents.END_SERVER_TICK.register(server -> {
-            if (!gameRunning) return;
-            if (server.getTicks() % 20 != 0) return;
-
-            // Check runners for death
-            for (UUID id : new HashSet<>(runners)) {
-                ServerPlayerEntity runner = server.getPlayerManager().getPlayer(id);
-                if (runner != null && runner.isDead()) {
-                    broadcast(server, "§c§l" + runner.getName().getString() + " was caught! Hunters win!");
-                    endGame(server, null);
-                    return;
-                }
-            }
-
-            // Check hunters for death — restore compass on respawn
-            for (UUID id : new HashSet<>(hunters)) {
+            // Hunter death -> restore their compass on respawn.
+            for (UUID id : new ArrayList<>(hunters)) {
                 ServerPlayerEntity hunter = server.getPlayerManager().getPlayer(id);
                 if (hunter != null && !hunter.isDead() && pendingCompassRestore.contains(id)) {
                     pendingCompassRestore.remove(id);
                     removeAllManhuntCompasses(hunter);
                     giveCompassTo(hunter);
                 }
-                if (hunter != null && hunter.isDead() && hunters.contains(id)) {
+                if (hunter != null && hunter.isDead()) {
                     pendingCompassRestore.add(id);
                 }
             }
@@ -334,13 +414,42 @@ public class ManhuntMod implements DedicatedServerModInitializer {
         if (message != null) broadcast(server, message);
         gameRunning = false;
         graceTicksLeft = 0;
+
+        // Put any eliminated/spectating runners back to survival at their spawn point (no /kill).
+        for (UUID id : eliminatedRunners) {
+            ServerPlayerEntity p = server.getPlayerManager().getPlayer(id);
+            if (p != null) restoreToSurvivalAtSpawn(server, p);
+        }
+        // Also clean up any tracker compasses left in hunters' inventories.
+        for (UUID id : hunters) {
+            ServerPlayerEntity p = server.getPlayerManager().getPlayer(id);
+            if (p != null) removeAllManhuntCompasses(p);
+        }
+
         hunters.clear();
         runners.clear();
+        eliminatedRunners.clear();
         pendingCompassRestore.clear();
         runnerPortalPositions.clear();
         runnerLastDimension.clear();
         runnerLastPos.clear();
         hunterTarget.clear();
+    }
+
+    // Set a player to survival and send them to their spawn point (bed if set, else world spawn).
+    private void restoreToSurvivalAtSpawn(MinecraftServer server, ServerPlayerEntity player) {
+        player.setGameMode(GameMode.SURVIVAL);
+        ServerWorld targetWorld = null;
+        BlockPos spawnPos = null;
+        if (player.isSpawnPointSet() && player.getSpawnPointPosition() != null) {
+            targetWorld = server.getWorld(player.getSpawnPointDimension());
+            spawnPos = player.getSpawnPointPosition();
+        }
+        if (targetWorld == null) {
+            targetWorld = server.getOverworld();
+            spawnPos = targetWorld.getSpawnPos();
+        }
+        player.teleport(targetWorld, spawnPos.getX() + 0.5, spawnPos.getY(), spawnPos.getZ() + 0.5, player.yaw, player.pitch);
     }
 
     private void removeAllManhuntCompasses(ServerPlayerEntity player) {
@@ -379,10 +488,16 @@ public class ManhuntMod implements DedicatedServerModInitializer {
         hunter.inventory.insertStack(compass);
     }
 
-    // Ordered, stable list of currently-online runners (sorted by name for a predictable cycle order).
+    private boolean isAlive(UUID runnerId) {
+        return runners.contains(runnerId) && !eliminatedRunners.contains(runnerId);
+    }
+
+    // Ordered, stable list of currently-online, in-play (non-eliminated) runners.
+    // Sorted by name for a predictable right-click cycle order.
     private List<ServerPlayerEntity> onlineRunners(MinecraftServer server) {
         List<ServerPlayerEntity> list = new ArrayList<>();
         for (UUID id : runners) {
+            if (eliminatedRunners.contains(id)) continue;
             ServerPlayerEntity p = server.getPlayerManager().getPlayer(id);
             if (p != null) list.add(p);
         }
@@ -390,17 +505,52 @@ public class ManhuntMod implements DedicatedServerModInitializer {
         return list;
     }
 
+    // The lowest-index (first-assigned) runner who is still alive and online. Eliminated spectators
+    // are kept in this runner's dimension.
+    private ServerPlayerEntity lowestIndexAliveRunner(MinecraftServer server) {
+        for (UUID id : runners) { // LinkedHashSet preserves assignment order
+            if (eliminatedRunners.contains(id)) continue;
+            ServerPlayerEntity p = server.getPlayerManager().getPlayer(id);
+            if (p != null) return p;
+        }
+        return null;
+    }
+
+    private boolean noHunterOnline(MinecraftServer server) {
+        for (UUID id : hunters) {
+            if (server.getPlayerManager().getPlayer(id) != null) return false;
+        }
+        return true;
+    }
+
+    private String nameOf(MinecraftServer server, UUID id) {
+        ServerPlayerEntity p = server.getPlayerManager().getPlayer(id);
+        if (p != null) return p.getName().getString();
+        // Offline: fall back to the stored profile name if available.
+        com.mojang.authlib.GameProfile profile = server.getUserCache().getByUuid(id);
+        return profile != null ? profile.getName() : "A runner";
+    }
+
+    // Eliminate a runner who just died: respawn them off the death screen (NOT /kill), then spectator.
+    private void eliminateRunner(MinecraftServer server, ServerPlayerEntity runner) {
+        UUID id = runner.getUuid();
+        eliminatedRunners.add(id);
+        broadcast(server, "§c§l" + runner.getName().getString() + " was caught!");
+        ServerPlayerEntity respawned = server.getPlayerManager().respawnPlayer(runner, false);
+        respawned.setGameMode(GameMode.SPECTATOR);
+    }
+
     // Resolve which runner a hunter's compass should track this tick.
-    // Honors an explicit target if that runner is still online; otherwise falls back to nearest
-    // (and clears a stale target so the compass name reverts to "nearest").
+    // Honors an explicit target if that runner is still alive; otherwise falls back to nearest alive
+    // (and clears a stale target so the compass reverts to "nearest").
     private ServerPlayerEntity resolveTarget(MinecraftServer server, UUID hunterId) {
         ServerPlayerEntity hunter = server.getPlayerManager().getPlayer(hunterId);
         if (hunter == null) return null;
         UUID targetId = hunterTarget.get(hunterId);
         if (targetId != null) {
             ServerPlayerEntity target = server.getPlayerManager().getPlayer(targetId);
-            if (target != null && runners.contains(targetId)) return target;
-            hunterTarget.remove(hunterId); // target left the game — revert to nearest
+            if (target != null && isAlive(targetId)) return target;
+            hunterTarget.remove(hunterId); // target died or left — revert to nearest
         }
         return getNearestRunner(server, hunter);
     }
@@ -409,6 +559,7 @@ public class ManhuntMod implements DedicatedServerModInitializer {
         ServerPlayerEntity nearest = null;
         double nearestDist = Double.MAX_VALUE;
         for (UUID runnerId : runners) {
+            if (eliminatedRunners.contains(runnerId)) continue;
             ServerPlayerEntity runner = server.getPlayerManager().getPlayer(runnerId);
             if (runner == null) continue;
             double dist = hunter.squaredDistanceTo(runner);

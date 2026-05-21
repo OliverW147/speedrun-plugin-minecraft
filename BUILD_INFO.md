@@ -84,8 +84,10 @@ Note: `ManhuntPlus-1.5.0 (1).jar` is a **Spigot plugin** and will never load on 
 | `/manhunt status` | Show current game state, roles, settings |
 | `/manhunt setgrace <seconds>` | Set grace period duration (0–300s, default 30) |
 | `/manhunt setrange <blocks>` | Set compass dead zone radius (0–10000, default 50) |
+| `/manhunt compass` | Give **the sender** a fresh tracker compass (refused if the sender is a runner; must be run by a player) |
 
 All player name arguments support **tab autocomplete**.
+`/hunter` and `/runner` can be used **mid-game** — a new hunter is equipped with a compass immediately; a new runner is put back in play (survival, un-eliminated).
 
 ---
 
@@ -97,10 +99,15 @@ All player name arguments support **tab autocomplete**.
 - **Compass restored on death**: If a hunter dies, their compass is automatically restored when they respawn.
 - **Dead zone**: Within a configurable XZ radius of the runner, the compass spins and shows "<runner> is nearby!" — prevents exact pinpointing.
 - **Cross-dimension**: If the tracked runner is in another dimension, the compass points at the runner's **last known position in the hunter's dimension** (if the runner has ever been there). If the tracked runner has **never** visited the hunter's current dimension, the compass **spins** and shows "<runner> is in another dimension!". Visited-dimension history is tracked per runner.
+- **Multiple runners — elimination, not instant win**: When a runner dies (or disconnects), they are **eliminated**, not game-over. They are put into **spectator** (via a normal respawn — never `/kill`) and continuously kept in the **dimension of the lowest-index (first-assigned) alive runner**, with a free camera, until the game ends. The game continues until **all** runners are eliminated.
 - **Win conditions**:
-  - Runner dies → "Hunters win!"
-  - Runner kills the Ender Dragon → "Runner wins!"
+  - **All** runners eliminated (dead/disconnected) → "Hunters win!"
+  - A runner kills the Ender Dragon → "Runner wins!"
+  - **All hunters disconnect** → "Runner(s) win!"
   - `/manhunt stop` → manual end
+  - On any end, eliminated runners are restored to **survival at their spawn point**.
+- **Disconnect = death**: A runner who logs off mid-game is treated as eliminated.
+- **Every-tick polling**: Death/elimination, dimension tracking, spectator locking, and compass updates run every tick (not every 20), so the right-click target switch is effectively instant.
 - **No coordinates, no distance** shown to hunters — action bar only shows proximity/dimension messages.
 
 ---
@@ -112,3 +119,6 @@ All player name arguments support **tab autocomplete**.
 - `broadcastChatMessage` in 1.16.1 requires 3 args: `(Text, MessageType, UUID)`.
 - Dragon kill detected via `minecraft:end/kill_dragon` advancement tracker.
 - Compass tracking uses lodestone NBT (`LodestonePos`, `LodestoneDimension`, `LodestoneTracked=false`) — works in Nether and End.
+- Right-click toggle uses `UseItemCallback` (`fabric-events-interaction-v0`). The 2-arg `TypedActionResult.success(T, boolean)` is **unmapped** in this yarn build — use `TypedActionResult.consume(stack)` to swallow the click instead.
+- Eliminating a runner uses `PlayerManager.respawnPlayer(player, false)` to clear the death screen, then `setGameMode(SPECTATOR)` — deliberately **not** `/kill`. The returned (new) player entity must be used after respawn.
+- `runners`/`hunters` are `LinkedHashSet` so "lowest-index alive runner" follows assignment order. Eliminated runners stay in `runners` but are tracked in a separate `eliminatedRunners` set.
