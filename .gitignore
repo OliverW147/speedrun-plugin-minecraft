@@ -1,0 +1,23 @@
+# Gradle
+.gradle/
+build/
+out/
+gradle-dist/
+*.zip
+
+# Downloaded dependency jars (fetched by build / kept locally)
+libs/
+
+# IDE
+.idea/
+*.iml
+.vscode/
+.settings/
+.classpath
+.project
+bin/
+
+# OS
+*.log
+.DS_Store
+Thumbs.db

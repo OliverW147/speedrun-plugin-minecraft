@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "id": "manhunt",
+  "version": "1.0.0",
+  "name": "Manhunt",
+  "description": "Simple manhunt mod for Fabric 1.16.1",
+  "authors": ["custom"],
+  "environment": "*",
+  "entrypoints": {
+    "server": ["com.manhunt.ManhuntMod"]
+  },
+  "depends": {
+    "fabricloader": ">=0.11.3",
+    "fabric": "*",
+    "minecraft": "1.16.1"
+  }
+}
