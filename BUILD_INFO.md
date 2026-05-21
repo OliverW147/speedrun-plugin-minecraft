@@ -82,8 +82,8 @@ Note: `ManhuntPlus-1.5.0 (1).jar` is a **Spigot plugin** and will never load on 
 | `/manhunt start` | Start the game (needs ≥1 hunter and ≥1 runner) |
 | `/manhunt stop` | End the game |
 | `/manhunt status` | Show current game state, roles, settings |
-| `/manhunt setgrace <seconds>` | Set grace period duration (0–300s, default 30) |
-| `/manhunt setrange <blocks>` | Set compass dead zone radius (0–10000, default 50) |
+| `/manhunt setgrace <seconds>` | Set grace period duration (0–300s, default 0) |
+| `/manhunt setrange <blocks>` | Set compass dead zone radius (0–10000, default 20) |
 | `/manhunt compass` | Give **the sender** a fresh tracker compass (refused if the sender is a runner; must be run by a player) |
 
 All player name arguments support **tab autocomplete**.

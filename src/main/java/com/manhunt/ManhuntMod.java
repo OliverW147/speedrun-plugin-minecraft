@@ -247,11 +247,12 @@ public class ManhuntMod implements DedicatedServerModInitializer {
         ServerTickEvents.END_SERVER_TICK.register(server -> {
             if (!gameRunning) return;
 
-            // Grace period countdown
+            // Grace period: freeze hunters and show the countdown. The world is still LIVE during grace —
+            // win/death/dragon checks below run regardless, so a runner dying or beating the dragon during
+            // grace still counts.
             if (graceTicksLeft > 0) {
                 graceTicksLeft--;
 
-                // Freeze all hunters every tick during grace
                 for (UUID id : hunters) {
                     ServerPlayerEntity h = server.getPlayerManager().getPlayer(id);
                     if (h != null) {
@@ -276,10 +277,9 @@ public class ManhuntMod implements DedicatedServerModInitializer {
                     broadcast(server, "§a§lGO! Hunters are released!");
                     broadcastTitle(server, "§a§lGO!");
                 }
-                return;
             }
 
-            // --- Everything below runs EVERY tick (no 20-tick gating) for responsiveness. ---
+            // --- Everything below runs EVERY tick, including during grace. ---
 
             // Win: all hunters disconnected -> runners win. (Only meaningful if hunters were assigned.)
             if (!hunters.isEmpty() && noHunterOnline(server)) {
@@ -315,9 +315,10 @@ public class ManhuntMod implements DedicatedServerModInitializer {
                 }
             }
 
-            // Win: every runner eliminated -> hunters win. (Only if runners were assigned.)
-            if (!runners.isEmpty() && eliminatedRunners.containsAll(runners)) {
-                broadcast(server, "§c§lAll runners caught! Hunters win!");
+            // Win: no runners left in play -> hunters win. This covers both "every runner eliminated"
+            // and "the last runner was reassigned to hunter mid-game" (runners set became empty).
+            if (runners.isEmpty() || eliminatedRunners.containsAll(runners)) {
+                broadcast(server, "§c§lHunters win!");
                 endGame(server, null);
                 return;
             }
@@ -631,6 +632,7 @@ public class ManhuntMod implements DedicatedServerModInitializer {
         String runnerName = runner.getName().getString();
         // What the compass is tracking, shown both as the item name and (when relevant) on the action bar.
         String trackingLabel = locked ? runnerName : runnerName + " §7(nearest)";
+        String desiredName = "§6Tracker: §e" + trackingLabel;
 
         String actionBar;
         if (!sameDim) {
@@ -645,7 +647,10 @@ public class ManhuntMod implements DedicatedServerModInitializer {
             ItemStack stack = hunter.inventory.getStack(i);
             if (!isManhuntCompass(stack)) continue;
             CompoundTag tag = stack.getOrCreateTag();
-            stack.setCustomName(new LiteralText("§6Tracker: §e" + trackingLabel).formatted(Formatting.ITALIC));
+            // Only rewrite the name when the tracked target actually changed (avoids 20x/sec churn).
+            if (!stack.getName().getString().equals(desiredName)) {
+                stack.setCustomName(new LiteralText(desiredName).formatted(Formatting.ITALIC));
+            }
 
             if (inDeadZone) {
                 // Point at a nonexistent dimension so the compass spins rather than pointing to spawn
