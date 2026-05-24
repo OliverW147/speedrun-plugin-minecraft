@@ -21,3 +21,6 @@ bin/
 *.log
 .DS_Store
 Thumbs.db
+
+# Internal docs
+BUILD_INFO.md
