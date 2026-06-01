@@ -1,0 +1,764 @@
+package com.manhunt;
+
+import com.mojang.brigadier.arguments.IntegerArgumentType;
+import com.mojang.brigadier.arguments.StringArgumentType;
+import com.mojang.brigadier.suggestion.SuggestionProvider;
+import net.fabricmc.api.DedicatedServerModInitializer;
+import net.fabricmc.fabric.api.command.v1.CommandRegistrationCallback;
+import net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents;
+import net.fabricmc.fabric.api.event.player.UseItemCallback;
+import net.minecraft.entity.boss.dragon.EnderDragonEntity;
+import net.minecraft.entity.boss.dragon.EnderDragonFight;
+import net.minecraft.entity.player.PlayerEntity;
+import net.minecraft.item.ItemStack;
+import net.minecraft.item.Items;
+import net.minecraft.nbt.CompoundTag;
+import net.minecraft.network.MessageType;
+import net.minecraft.server.MinecraftServer;
+import net.minecraft.server.network.ServerPlayerEntity;
+import net.minecraft.server.world.ServerWorld;
+import net.minecraft.text.LiteralText;
+import net.minecraft.util.Formatting;
+import net.minecraft.util.Hand;
+import net.minecraft.util.TypedActionResult;
+import net.minecraft.util.math.BlockPos;
+import net.minecraft.util.registry.RegistryKey;
+import net.minecraft.world.GameMode;
+import net.minecraft.world.World;
+
+import java.util.*;
+
+import static net.minecraft.server.command.CommandManager.argument;
+import static net.minecraft.server.command.CommandManager.literal;
+
+public class ManhuntMod implements DedicatedServerModInitializer {
+
+    // LinkedHashSet for stable insertion order — "lowest-index alive runner" relies on this order.
+    private static final Set<UUID> hunters = new LinkedHashSet<>();
+    private static final Set<UUID> runners = new LinkedHashSet<>();
+    // Runners who have died or disconnected. They remain in `runners` but are out of play:
+    // forced to spectator (no /kill) and locked to a living runner's dimension until the game ends.
+    private static final Set<UUID> eliminatedRunners = new LinkedHashSet<>();
+    private static boolean gameRunning = false;
+    private static int gracePeriod = 0;
+    private static int deadZoneRadius = 20;
+    private static int graceTicksLeft = 0;
+
+    // Ender Dragon win detection via the End's dragon fight (works for ANY kill — melee, beds, etc.,
+    // unlike the kill_dragon advancement which needs a player credited with the kill).
+    private static boolean dragonKilledBaseline = false; // was the dragon already dead in this world at game start?
+    private static boolean sawLiveDragon = false;        // have we observed a live dragon in the End this game?
+
+    // Map<runnerUUID, Map<dimensionId, portalBlockPos>> — portal positions per dimension
+    private static final Map<UUID, Map<String, BlockPos>> runnerPortalPositions = new HashMap<>();
+    // Previous dimension per runner, to detect dimension changes
+    private static final Map<UUID, String> runnerLastDimension = new HashMap<>();
+    // Last known BlockPos per runner (from previous tick), used to capture departure position on dim change
+    private static final Map<UUID, BlockPos> runnerLastPos = new HashMap<>();
+    // Server tick at which a runner was respawned-as-eliminated. We must NOT cross-dimension teleport a
+    // player on the same tick they were respawned — doing so corrupts chunk-ticket tracking and crashes
+    // the server tick (NPE in ChunkTicketManager.updateCameraPosition). Wait a few ticks for it to settle.
+    private static final Map<UUID, Integer> eliminationTick = new HashMap<>();
+    private static final int RESPAWN_SETTLE_TICKS = 5;
+
+    // Per-hunter tracked runner. Absent (or value not in `runners`) = track nearest runner (default).
+    // Toggled by right-clicking the compass, which cycles: nearest -> runner0 -> runner1 -> ... -> nearest.
+    private static final Map<UUID, UUID> hunterTarget = new HashMap<>();
+
+    private static final SuggestionProvider<net.minecraft.server.command.ServerCommandSource> ONLINE_PLAYERS =
+        (ctx, builder) -> {
+            String remaining = builder.getRemaining().toLowerCase();
+            for (ServerPlayerEntity p : ctx.getSource().getMinecraftServer().getPlayerManager().getPlayerList()) {
+                String name = p.getName().getString();
+                if (name.toLowerCase().startsWith(remaining)) builder.suggest(name);
+            }
+            return builder.buildFuture();
+        };
+
+    @Override
+    public void onInitializeServer() {
+        CommandRegistrationCallback.EVENT.register((dispatcher, dedicated) -> {
+
+            dispatcher.register(literal("manhunt")
+                .then(literal("start").executes(ctx -> {
+                    if (hunters.isEmpty() || runners.isEmpty()) {
+                        ctx.getSource().sendFeedback(new LiteralText("§cNeed at least one hunter and one runner."), false);
+                        return 0;
+                    }
+                    if (gameRunning) {
+                        ctx.getSource().sendFeedback(new LiteralText("§cGame already running. Use /manhunt stop first."), false);
+                        return 0;
+                    }
+                    MinecraftServer server = ctx.getSource().getMinecraftServer();
+                    gameRunning = true;
+                    graceTicksLeft = gracePeriod * 20;
+                    eliminatedRunners.clear();
+
+                    // Baseline the dragon state: if it's already dead in this world, a "became dead" edge
+                    // won't fire, so we fall back to detecting an alive->dead transition this game instead.
+                    ServerWorld endAtStart = server.getWorld(World.END);
+                    EnderDragonFight fightAtStart = endAtStart != null ? endAtStart.getEnderDragonFight() : null;
+                    dragonKilledBaseline = fightAtStart != null && fightAtStart.hasPreviouslyKilled();
+                    sawLiveDragon = false;
+
+                    // Freeze hunters
+                    for (UUID id : hunters) {
+                        ServerPlayerEntity h = server.getPlayerManager().getPlayer(id);
+                        if (h != null) h.setVelocity(0, 0, 0);
+                    }
+
+                    // Make sure runners start in survival (e.g. if a prior game left someone spectating).
+                    for (UUID id : runners) {
+                        ServerPlayerEntity r = server.getPlayerManager().getPlayer(id);
+                        if (r != null && r.interactionManager.getGameMode() == GameMode.SPECTATOR) {
+                            r.setGameMode(GameMode.SURVIVAL);
+                        }
+                    }
+
+                    broadcast(server, "§6Manhunt starting! Hunters are frozen for §e" + gracePeriod + " §6seconds...");
+                    giveCompasses(server);
+
+                    // Tell hunters how to use their tracker compass.
+                    for (UUID id : hunters) {
+                        ServerPlayerEntity h = server.getPlayerManager().getPlayer(id);
+                        if (h != null) {
+                            h.sendMessage(new LiteralText("§6You got a §eRunner Tracker§6 compass."), false);
+                            h.sendMessage(new LiteralText("§7Right-click it to switch which runner you track, or use §f/manhunt compass§7 to get a new one."), false);
+                        }
+                    }
+                    return 1;
+                }))
+                .then(literal("stop").executes(ctx -> {
+                    endGame(ctx.getSource().getMinecraftServer(), "§cManhunt stopped.");
+                    return 1;
+                }))
+                .then(literal("status").executes(ctx -> {
+                    MinecraftServer server = ctx.getSource().getMinecraftServer();
+                    String status = gameRunning
+                        ? (graceTicksLeft > 0 ? "§eGRACE PERIOD (" + (graceTicksLeft / 20) + "s)" : "§aRUNNING")
+                        : "§cSTOPPED";
+                    StringBuilder msg = new StringBuilder("§6Manhunt: " + status + "\n§eHunters: ");
+                    for (UUID id : hunters) {
+                        ServerPlayerEntity p = server.getPlayerManager().getPlayer(id);
+                        msg.append(p != null ? p.getName().getString() : "?").append(" ");
+                    }
+                    msg.append("\n§bRunners: ");
+                    for (UUID id : runners) {
+                        ServerPlayerEntity p = server.getPlayerManager().getPlayer(id);
+                        msg.append(p != null ? p.getName().getString() : "?").append(" ");
+                    }
+                    msg.append("\n§7Grace: §f").append(gracePeriod).append("s  §7Dead zone: §f").append(deadZoneRadius).append(" blocks");
+                    ctx.getSource().sendFeedback(new LiteralText(msg.toString()), false);
+                    return 1;
+                }))
+                .then(literal("setgrace")
+                    .then(argument("seconds", IntegerArgumentType.integer(0, 300)).executes(ctx -> {
+                        gracePeriod = IntegerArgumentType.getInteger(ctx, "seconds");
+                        ctx.getSource().sendFeedback(new LiteralText("§aGrace period set to §e" + gracePeriod + " §aseconds."), false);
+                        return 1;
+                    })))
+                .then(literal("compass").executes(ctx -> {
+                    if (!gameRunning) {
+                        ctx.getSource().sendFeedback(new LiteralText("§cNo game running."), false);
+                        return 0;
+                    }
+                    net.minecraft.entity.Entity senderEntity = ctx.getSource().getEntity();
+                    if (!(senderEntity instanceof ServerPlayerEntity)) {
+                        ctx.getSource().sendFeedback(new LiteralText("§cThis must be run by a player."), false);
+                        return 0;
+                    }
+                    ServerPlayerEntity self = (ServerPlayerEntity) senderEntity;
+                    if (!hunters.contains(self.getUuid())) {
+                        ctx.getSource().sendFeedback(new LiteralText("§cOnly hunters get a tracker compass."), false);
+                        return 0;
+                    }
+                    removeAllManhuntCompasses(self);
+                    giveCompassTo(self);
+                    ctx.getSource().sendFeedback(new LiteralText("§aHere's your tracker compass."), false);
+                    return 1;
+                }))
+                .then(literal("setrange")
+                    .then(argument("blocks", IntegerArgumentType.integer(0, 10000)).executes(ctx -> {
+                        deadZoneRadius = IntegerArgumentType.getInteger(ctx, "blocks");
+                        ctx.getSource().sendFeedback(new LiteralText("§aCompass dead zone set to §e" + deadZoneRadius + " §ablocks."), false);
+                        return 1;
+                    })))
+            );
+
+            dispatcher.register(literal("hunter")
+                .then(argument("player", StringArgumentType.word()).suggests(ONLINE_PLAYERS).executes(ctx -> {
+                    String name = StringArgumentType.getString(ctx, "player");
+                    MinecraftServer server = ctx.getSource().getMinecraftServer();
+                    ServerPlayerEntity target = server.getPlayerManager().getPlayer(name);
+                    if (target == null) {
+                        ctx.getSource().sendFeedback(new LiteralText("§cPlayer not found: " + name), false);
+                        return 0;
+                    }
+                    UUID id = target.getUuid();
+                    runners.remove(id);
+                    eliminatedRunners.remove(id);
+                    eliminationTick.remove(id);
+                    hunterTarget.remove(id);
+                    hunters.add(id);
+                    // If they were a spectating (eliminated) runner, put them back into play as a hunter.
+                    if (target.interactionManager.getGameMode() == GameMode.SPECTATOR) {
+                        target.setGameMode(GameMode.SURVIVAL);
+                    }
+                    ctx.getSource().sendFeedback(new LiteralText("§e" + name + " §ais now a hunter."), false);
+                    target.sendMessage(new LiteralText("§aYou are now a §ehunter§a!"), false);
+                    // Mid-game: equip and brief them immediately.
+                    if (gameRunning) {
+                        removeAllManhuntCompasses(target);
+                        giveCompassTo(target);
+                        target.sendMessage(new LiteralText("§7Right-click the compass to switch which runner you track, or use §f/manhunt compass§7."), false);
+                    }
+                    return 1;
+                }))
+            );
+
+            dispatcher.register(literal("runner")
+                .then(argument("player", StringArgumentType.word()).suggests(ONLINE_PLAYERS).executes(ctx -> {
+                    String name = StringArgumentType.getString(ctx, "player");
+                    MinecraftServer server = ctx.getSource().getMinecraftServer();
+                    ServerPlayerEntity target = server.getPlayerManager().getPlayer(name);
+                    if (target == null) {
+                        ctx.getSource().sendFeedback(new LiteralText("§cPlayer not found: " + name), false);
+                        return 0;
+                    }
+                    UUID id = target.getUuid();
+                    hunters.remove(id);
+                    eliminatedRunners.remove(id); // re-added runner is back in play
+                    eliminationTick.remove(id);
+                    runners.add(id);
+                    removeAllManhuntCompasses(target); // runners don't carry a tracker
+                    if (target.interactionManager.getGameMode() == GameMode.SPECTATOR) {
+                        target.setGameMode(GameMode.SURVIVAL);
+                    }
+                    // Seed dimension tracking so the compass logic knows where this runner is right away.
+                    if (gameRunning) {
+                        String dim = target.world.getRegistryKey().getValue().toString();
+                        runnerPortalPositions.computeIfAbsent(id, k -> new HashMap<>()).put(dim, target.getBlockPos());
+                        runnerLastDimension.put(id, dim);
+                        runnerLastPos.put(id, target.getBlockPos());
+                    }
+                    ctx.getSource().sendFeedback(new LiteralText("§b" + name + " §ais now the runner."), false);
+                    target.sendMessage(new LiteralText("§aYou are now the §bspeedrunner§a! Good luck!"), false);
+                    return 1;
+                }))
+            );
+        });
+
+        // Right-click the tracker compass to cycle which runner it tracks.
+        UseItemCallback.EVENT.register((player, world, hand) -> {
+            ItemStack stack = player.getStackInHand(hand);
+            if (world.isClient || !gameRunning) return TypedActionResult.pass(stack);
+            if (!(player instanceof ServerPlayerEntity)) return TypedActionResult.pass(stack);
+            if (!isManhuntCompass(stack)) return TypedActionResult.pass(stack);
+            ServerPlayerEntity hunter = (ServerPlayerEntity) player;
+            if (!hunters.contains(hunter.getUuid())) return TypedActionResult.pass(stack);
+
+            cycleTarget(hunter);
+            // Consume so the click doesn't also count as a normal item use; keeps the stack in hand
+            // without triggering the client swing/use packet that success() would.
+            return TypedActionResult.consume(stack);
+        });
+
+        ServerTickEvents.END_SERVER_TICK.register(server -> {
+            if (!gameRunning) return;
+
+            // Grace period: freeze hunters and show the countdown. The world is still LIVE during grace —
+            // win/death/dragon checks below run regardless, so a runner dying or beating the dragon during
+            // grace still counts.
+            if (graceTicksLeft > 0) {
+                graceTicksLeft--;
+
+                for (UUID id : hunters) {
+                    ServerPlayerEntity h = server.getPlayerManager().getPlayer(id);
+                    if (h != null) {
+                        h.setVelocity(0, 0, 0);
+                        h.velocityModified = true;
+                    }
+                }
+
+                // Countdown titles at 10, 5, 4, 3, 2, 1
+                int secsLeft = graceTicksLeft / 20;
+                int ticks = graceTicksLeft % 20;
+                if (ticks == 0) {
+                    if (secsLeft <= 5 && secsLeft > 0) {
+                        String color = secsLeft <= 3 ? "§c" : "§e";
+                        broadcastTitle(server, color + secsLeft);
+                    } else if (secsLeft == 10) {
+                        broadcastTitle(server, "§e10");
+                    }
+                }
+
+                if (graceTicksLeft == 0) {
+                    broadcast(server, "§a§lGO! Hunters are released!");
+                    broadcastTitle(server, "§a§lGO!");
+                }
+            }
+
+            // --- Everything below runs EVERY tick, including during grace. ---
+
+            // Win: all hunters disconnected -> runners win. (Only meaningful if hunters were assigned.)
+            if (!hunters.isEmpty() && noHunterOnline(server)) {
+                broadcast(server, "§b§lAll hunters left! Runner(s) win!");
+                endGame(server, null);
+                return;
+            }
+
+            // Dragon kill -> runner wins. Detected via the End's dragon fight, so it works for ANY kill
+            // method (melee, bed/respawn-anchor explosions, etc.) — the kill_dragon advancement only fires
+            // when a player is credited with the kill, which bed-kills don't do. Checked BEFORE the
+            // elimination logic below, since killing the dragon often kills the runner in the same instant.
+            ServerWorld end = server.getWorld(World.END);
+            EnderDragonFight fight = end != null ? end.getEnderDragonFight() : null;
+            if (fight != null) {
+                boolean dragonAliveNow = false;
+                for (EnderDragonEntity d : end.getAliveEnderDragons()) {
+                    if (d.isAlive()) { dragonAliveNow = true; break; }
+                }
+                if (dragonAliveNow) sawLiveDragon = true;
+
+                // Win when the dragon dies this game: either the fight's kill flag flips from the start
+                // baseline (normal first kill), or a dragon we saw alive this game is now gone with the
+                // fight marked killed (a re-kill in a world where it had already been killed before).
+                boolean firstKillThisGame = !dragonKilledBaseline && fight.hasPreviouslyKilled();
+                boolean reKillThisGame = sawLiveDragon && !dragonAliveNow && fight.hasPreviouslyKilled();
+                if (firstKillThisGame || reKillThisGame) {
+                    // Team game: the dragon dying is a win for the runner side as a whole.
+                    ServerPlayerEntity credited = nearestRunnerInEnd(server, end);
+                    String prefix = credited != null ? credited.getName().getString() + " killed the dragon! " : "The dragon is dead! ";
+                    broadcast(server, "§b§l" + prefix + "Runners win!");
+                    endGame(server, null);
+                    return;
+                }
+            }
+
+            // Detect runner elimination: death (on the death screen) or disconnect. Eliminated runners
+            // become spectators (via a normal respawn, never /kill) and are out of play.
+            for (UUID id : new ArrayList<>(runners)) {
+                if (eliminatedRunners.contains(id)) continue;
+                ServerPlayerEntity runner = server.getPlayerManager().getPlayer(id);
+                if (runner == null) {
+                    // Disconnected mid-game = treated as dead.
+                    eliminatedRunners.add(id);
+                    broadcast(server, "§c§l" + nameOf(server, id) + " disconnected — eliminated!");
+                } else if (runner.isDead()) {
+                    eliminateRunner(server, runner);
+                }
+            }
+
+            // Win: no runners left in play -> hunters win. This covers both "every runner eliminated"
+            // and "the last runner was reassigned to hunter mid-game" (runners set became empty).
+            if (runners.isEmpty() || eliminatedRunners.containsAll(runners)) {
+                broadcast(server, "§c§lHunters win!");
+                endGame(server, null);
+                return;
+            }
+
+            // Keep eliminated (online) runners as spectators, locked to the lowest-index alive runner's dimension.
+            ServerPlayerEntity anchor = lowestIndexAliveRunner(server);
+            if (anchor != null) {
+                RegistryKey<World> anchorDim = anchor.world.getRegistryKey();
+                for (UUID id : eliminatedRunners) {
+                    ServerPlayerEntity dead = server.getPlayerManager().getPlayer(id);
+                    if (dead == null) continue;
+                    if (dead.interactionManager.getGameMode() != GameMode.SPECTATOR) {
+                        dead.setGameMode(GameMode.SPECTATOR); // e.g. after reconnect
+                    }
+                    if (dead.world.getRegistryKey().equals(anchorDim)) continue; // already in the right dimension
+
+                    // Don't teleport while a respawn or a prior teleport is still settling — a cross-dimension
+                    // teleport in that window corrupts chunk-ticket tracking and crashes the server tick.
+                    Integer elimTick = eliminationTick.get(id);
+                    if (elimTick != null && server.getTicks() - elimTick < RESPAWN_SETTLE_TICKS) continue;
+                    if (dead.isInTeleportationState()) continue;
+
+                    ServerWorld w = server.getWorld(anchorDim);
+                    if (w != null) {
+                        dead.teleport(w, anchor.getX(), anchor.getY(), anchor.getZ(), dead.yaw, dead.pitch);
+                    }
+                }
+            }
+
+            // Record where each in-play runner has been, per dimension.
+            // runnerPortalPositions.get(runner).get(dim) = most recent position that runner was seen at in `dim`.
+            // Its presence for a dimension means "this runner has visited that dimension" — which the
+            // compass uses to decide whether to point (visited) or spin (never visited).
+            for (UUID runnerId : runners) {
+                if (eliminatedRunners.contains(runnerId)) continue;
+                ServerPlayerEntity runner = server.getPlayerManager().getPlayer(runnerId);
+                if (runner == null) continue;
+                String currentDim = runner.world.getRegistryKey().getValue().toString();
+                String lastDim = runnerLastDimension.get(runnerId);
+                Map<String, BlockPos> visited = runnerPortalPositions.computeIfAbsent(runnerId, k -> new HashMap<>());
+
+                if (lastDim != null && !lastDim.equals(currentDim)) {
+                    // Runner just changed dimension: pin the departure point in the dimension they left,
+                    // so a hunter still in that dimension points at the portal/exit the runner used.
+                    BlockPos departurePos = runnerLastPos.get(runnerId);
+                    if (departurePos != null) visited.put(lastDim, departurePos);
+                }
+
+                // Always refresh the runner's current location in their current dimension. This both seeds
+                // the runner's starting dimension (which never fires a change event) and keeps the
+                // last-known position fresh while they remain in a dimension.
+                visited.put(currentDim, runner.getBlockPos());
+                runnerLastDimension.put(runnerId, currentDim);
+                runnerLastPos.put(runnerId, runner.getBlockPos());
+            }
+
+            // Strip tracker compasses from anyone who isn't a hunter (picked up off the ground, etc.).
+            for (ServerPlayerEntity p : server.getPlayerManager().getPlayerList()) {
+                if (!hunters.contains(p.getUuid())) removeAllManhuntCompasses(p);
+            }
+
+            // Update each hunter's compass to point at their resolved (alive) target.
+            for (UUID hunterId : hunters) {
+                ServerPlayerEntity hunter = server.getPlayerManager().getPlayer(hunterId);
+                if (hunter == null) continue;
+
+                ServerPlayerEntity targetRunner = resolveTarget(server, hunterId);
+                if (targetRunner == null) continue;
+                updateCompass(hunter, targetRunner);
+            }
+
+            // Hunter death -> restore their compass on respawn.
+            for (UUID id : new ArrayList<>(hunters)) {
+                ServerPlayerEntity hunter = server.getPlayerManager().getPlayer(id);
+                if (hunter != null && !hunter.isDead() && pendingCompassRestore.contains(id)) {
+                    pendingCompassRestore.remove(id);
+                    removeAllManhuntCompasses(hunter);
+                    giveCompassTo(hunter);
+                }
+                if (hunter != null && hunter.isDead()) {
+                    pendingCompassRestore.add(id);
+                }
+            }
+        });
+
+    }
+
+    private static final Set<UUID> pendingCompassRestore = new HashSet<>();
+
+    private void broadcast(MinecraftServer server, String msg) {
+        server.getPlayerManager().broadcastChatMessage(new LiteralText(msg), MessageType.SYSTEM, UUID.randomUUID());
+    }
+
+    private void broadcastTitle(MinecraftServer server, String msg) {
+        for (ServerPlayerEntity p : server.getPlayerManager().getPlayerList()) {
+            p.networkHandler.sendPacket(new net.minecraft.network.packet.s2c.play.TitleS2CPacket(
+                net.minecraft.network.packet.s2c.play.TitleS2CPacket.Action.TITLE,
+                new LiteralText(msg)));
+            p.networkHandler.sendPacket(new net.minecraft.network.packet.s2c.play.TitleS2CPacket(
+                net.minecraft.network.packet.s2c.play.TitleS2CPacket.Action.TIMES, null, 0, 25, 10));
+        }
+    }
+
+    private void endGame(MinecraftServer server, String message) {
+        if (message != null) broadcast(server, message);
+        gameRunning = false;
+        graceTicksLeft = 0;
+
+        // Put any eliminated/spectating runners back to survival at their spawn point (no /kill).
+        for (UUID id : eliminatedRunners) {
+            ServerPlayerEntity p = server.getPlayerManager().getPlayer(id);
+            if (p != null) restoreToSurvivalAtSpawn(server, p);
+        }
+        // Also clean up any tracker compasses left in hunters' inventories.
+        for (UUID id : hunters) {
+            ServerPlayerEntity p = server.getPlayerManager().getPlayer(id);
+            if (p != null) removeAllManhuntCompasses(p);
+        }
+
+        hunters.clear();
+        runners.clear();
+        eliminatedRunners.clear();
+        eliminationTick.clear();
+        pendingCompassRestore.clear();
+        runnerPortalPositions.clear();
+        runnerLastDimension.clear();
+        runnerLastPos.clear();
+        hunterTarget.clear();
+        dragonKilledBaseline = false;
+        sawLiveDragon = false;
+    }
+
+    // Set a player to survival and send them to their spawn point (bed if set, else world spawn).
+    private void restoreToSurvivalAtSpawn(MinecraftServer server, ServerPlayerEntity player) {
+        player.setGameMode(GameMode.SURVIVAL);
+        ServerWorld targetWorld = null;
+        BlockPos spawnPos = null;
+        if (player.isSpawnPointSet() && player.getSpawnPointPosition() != null) {
+            targetWorld = server.getWorld(player.getSpawnPointDimension());
+            spawnPos = player.getSpawnPointPosition();
+        }
+        if (targetWorld == null) {
+            targetWorld = server.getOverworld();
+            spawnPos = targetWorld.getSpawnPos();
+        }
+        // A player eliminated this same tick was just respawned at their spawn point already; teleporting
+        // again mid-teleport would corrupt chunk-ticket state. Only move them if they're elsewhere and settled.
+        if (player.isInTeleportationState()) return;
+        if (player.world.getRegistryKey().equals(targetWorld.getRegistryKey())) return;
+        player.teleport(targetWorld, spawnPos.getX() + 0.5, spawnPos.getY(), spawnPos.getZ() + 0.5, player.yaw, player.pitch);
+    }
+
+    private void removeAllManhuntCompasses(ServerPlayerEntity player) {
+        for (int i = 0; i < player.inventory.size(); i++) {
+            if (isManhuntCompass(player.inventory.getStack(i))) {
+                player.inventory.removeStack(i);
+                i--; // adjust index after removal
+            }
+        }
+    }
+
+    private void giveCompasses(MinecraftServer server) {
+        for (UUID hunterId : hunters) {
+            ServerPlayerEntity hunter = server.getPlayerManager().getPlayer(hunterId);
+            if (hunter == null) continue;
+            if (!hasCompass(hunter)) giveCompassTo(hunter);
+        }
+    }
+
+    private boolean hasCompass(ServerPlayerEntity player) {
+        for (int i = 0; i < player.inventory.size(); i++) {
+            if (isManhuntCompass(player.inventory.getStack(i))) return true;
+        }
+        return false;
+    }
+
+    private static boolean isManhuntCompass(ItemStack s) {
+        return s.getItem() == Items.COMPASS && s.hasTag() && s.getTag().contains("manhunt");
+    }
+
+    private void giveCompassTo(ServerPlayerEntity hunter) {
+        ItemStack compass = new ItemStack(Items.COMPASS);
+        CompoundTag tag = compass.getOrCreateTag();
+        tag.putBoolean("manhunt", true);
+        compass.setCustomName(new LiteralText("§6Runner Tracker").formatted(Formatting.ITALIC));
+        hunter.inventory.insertStack(compass);
+    }
+
+    private boolean isAlive(UUID runnerId) {
+        return runners.contains(runnerId) && !eliminatedRunners.contains(runnerId);
+    }
+
+    // Ordered, stable list of currently-online, in-play (non-eliminated) runners.
+    // Sorted by name for a predictable right-click cycle order.
+    private List<ServerPlayerEntity> onlineRunners(MinecraftServer server) {
+        List<ServerPlayerEntity> list = new ArrayList<>();
+        for (UUID id : runners) {
+            if (eliminatedRunners.contains(id)) continue;
+            ServerPlayerEntity p = server.getPlayerManager().getPlayer(id);
+            if (p != null) list.add(p);
+        }
+        list.sort(Comparator.comparing(p -> p.getName().getString().toLowerCase()));
+        return list;
+    }
+
+    // The lowest-index (first-assigned) runner who is still alive and online. Eliminated spectators
+    // are kept in this runner's dimension.
+    private ServerPlayerEntity lowestIndexAliveRunner(MinecraftServer server) {
+        for (UUID id : runners) { // LinkedHashSet preserves assignment order
+            if (eliminatedRunners.contains(id)) continue;
+            ServerPlayerEntity p = server.getPlayerManager().getPlayer(id);
+            if (p != null) return p;
+        }
+        return null;
+    }
+
+    private boolean noHunterOnline(MinecraftServer server) {
+        for (UUID id : hunters) {
+            if (server.getPlayerManager().getPlayer(id) != null) return false;
+        }
+        return true;
+    }
+
+    private String nameOf(MinecraftServer server, UUID id) {
+        ServerPlayerEntity p = server.getPlayerManager().getPlayer(id);
+        if (p != null) return p.getName().getString();
+        // Offline: fall back to the stored profile name if available.
+        com.mojang.authlib.GameProfile profile = server.getUserCache().getByUuid(id);
+        return profile != null ? profile.getName() : "A runner";
+    }
+
+    // The in-play runner closest to the dragon, used only to name who gets credited for the kill.
+    private ServerPlayerEntity nearestRunnerInEnd(MinecraftServer server, ServerWorld end) {
+        ServerPlayerEntity best = null;
+        double bestDist = Double.MAX_VALUE;
+        for (UUID id : runners) {
+            if (eliminatedRunners.contains(id)) continue;
+            ServerPlayerEntity r = server.getPlayerManager().getPlayer(id);
+            if (r == null || r.world != end) continue;
+            // Distance to (0,?,0) — the dragon fights around the central exit portal.
+            double dx = r.getX(), dz = r.getZ();
+            double dist = dx * dx + dz * dz;
+            if (dist < bestDist) { bestDist = dist; best = r; }
+        }
+        if (best != null) return best;
+        // Fallback: any in-play runner at all.
+        for (UUID id : runners) {
+            if (eliminatedRunners.contains(id)) continue;
+            ServerPlayerEntity r = server.getPlayerManager().getPlayer(id);
+            if (r != null) return r;
+        }
+        return null;
+    }
+
+    // Eliminate a runner who just died: respawn them off the death screen (NOT /kill), then spectator.
+    // We record the respawn tick so the dimension-lock teleport waits for the respawn to settle (a
+    // same-tick cross-dimension teleport corrupts chunk-ticket state and crashes the server tick).
+    private void eliminateRunner(MinecraftServer server, ServerPlayerEntity runner) {
+        UUID id = runner.getUuid();
+        eliminatedRunners.add(id);
+        broadcast(server, "§c§l" + runner.getName().getString() + " was caught!");
+        ServerPlayerEntity respawned = server.getPlayerManager().respawnPlayer(runner, false);
+        respawned.setGameMode(GameMode.SPECTATOR);
+        eliminationTick.put(id, server.getTicks());
+    }
+
+    // Resolve which runner a hunter's compass should track this tick.
+    // Honors an explicit target if that runner is still alive; otherwise falls back to nearest alive
+    // (and clears a stale target so the compass reverts to "nearest").
+    private ServerPlayerEntity resolveTarget(MinecraftServer server, UUID hunterId) {
+        ServerPlayerEntity hunter = server.getPlayerManager().getPlayer(hunterId);
+        if (hunter == null) return null;
+        UUID targetId = hunterTarget.get(hunterId);
+        if (targetId != null) {
+            ServerPlayerEntity target = server.getPlayerManager().getPlayer(targetId);
+            if (target != null && isAlive(targetId)) return target;
+            hunterTarget.remove(hunterId); // target died or left — revert to nearest
+        }
+        return getNearestRunner(server, hunter);
+    }
+
+    private ServerPlayerEntity getNearestRunner(MinecraftServer server, ServerPlayerEntity hunter) {
+        ServerPlayerEntity nearest = null;
+        double nearestDist = Double.MAX_VALUE;
+        for (UUID runnerId : runners) {
+            if (eliminatedRunners.contains(runnerId)) continue;
+            ServerPlayerEntity runner = server.getPlayerManager().getPlayer(runnerId);
+            if (runner == null) continue;
+            double dist = hunter.squaredDistanceTo(runner);
+            if (dist < nearestDist) {
+                nearestDist = dist;
+                nearest = runner;
+            }
+        }
+        return nearest;
+    }
+
+    // Advance this hunter's compass target one step: nearest -> runner0 -> runner1 -> ... -> nearest.
+    private void cycleTarget(ServerPlayerEntity hunter) {
+        MinecraftServer server = hunter.getServer();
+        if (server == null) return;
+        List<ServerPlayerEntity> ordered = onlineRunners(server);
+        if (ordered.isEmpty()) return;
+
+        UUID current = hunterTarget.get(hunter.getUuid());
+        UUID next;
+        if (current == null) {
+            // nearest -> first runner
+            next = ordered.get(0).getUuid();
+        } else {
+            int idx = -1;
+            for (int i = 0; i < ordered.size(); i++) {
+                if (ordered.get(i).getUuid().equals(current)) { idx = i; break; }
+            }
+            // wrap back to nearest after the last runner (or if current target vanished)
+            next = (idx < 0 || idx == ordered.size() - 1) ? null : ordered.get(idx + 1).getUuid();
+        }
+
+        // No feedback message here: the compass name + action bar are refreshed next tick (<50ms)
+        // by updateCompass, which would immediately overwrite any popup shown here.
+        if (next == null) {
+            hunterTarget.remove(hunter.getUuid());
+        } else {
+            hunterTarget.put(hunter.getUuid(), next);
+        }
+    }
+
+    private void updateCompass(ServerPlayerEntity hunter, ServerPlayerEntity runner) {
+        String hunterDim = hunter.world.getRegistryKey().getValue().toString();
+        String runnerDim = runner.world.getRegistryKey().getValue().toString();
+        boolean sameDim = hunterDim.equals(runnerDim);
+
+        // Dead zone check — XZ distance only, same dimension only
+        double dx = hunter.getX() - runner.getX();
+        double dz = hunter.getZ() - runner.getZ();
+        double xzDist = Math.sqrt(dx * dx + dz * dz);
+        boolean inDeadZone = sameDim && xzDist <= deadZoneRadius;
+
+        // Cross-dimension: look up the runner's last-known position in the HUNTER's dimension.
+        // If absent, the tracked runner has never been to this dimension -> the compass will spin.
+        BlockPos portalPos = null;
+        if (!sameDim) {
+            Map<String, BlockPos> visited = runnerPortalPositions.get(runner.getUuid());
+            if (visited != null) portalPos = visited.get(hunterDim);
+        }
+
+        boolean locked = hunterTarget.containsKey(hunter.getUuid());
+        String runnerName = runner.getName().getString();
+        // What the compass is tracking, shown both as the item name and (when relevant) on the action bar.
+        String trackingLabel = locked ? runnerName : runnerName + " §7(nearest)";
+        String desiredName = "§6Tracker: §e" + trackingLabel;
+
+        String actionBar;
+        if (!sameDim) {
+            actionBar = "§7" + runnerName + " is in another dimension!" + (portalPos != null ? " (tracking portal)" : "");
+        } else if (inDeadZone) {
+            actionBar = "§e" + runnerName + " is nearby!";
+        } else {
+            actionBar = "";
+        }
+
+        for (int i = 0; i < hunter.inventory.size(); i++) {
+            ItemStack stack = hunter.inventory.getStack(i);
+            if (!isManhuntCompass(stack)) continue;
+            CompoundTag tag = stack.getOrCreateTag();
+            // Only rewrite the name when the tracked target actually changed (avoids 20x/sec churn).
+            if (!stack.getName().getString().equals(desiredName)) {
+                stack.setCustomName(new LiteralText(desiredName).formatted(Formatting.ITALIC));
+            }
+
+            if (inDeadZone) {
+                // Point at a nonexistent dimension so the compass spins rather than pointing to spawn
+                CompoundTag fakePos = new CompoundTag();
+                fakePos.putInt("X", 0); fakePos.putInt("Y", 0); fakePos.putInt("Z", 0);
+                tag.put("LodestonePos", fakePos);
+                tag.putString("LodestoneDimension", "manhunt:void");
+                tag.putBoolean("LodestoneTracked", false);
+            } else if (!sameDim && portalPos != null) {
+                // Runner is in another dim but has been to this one — point at their last-known spot here
+                CompoundTag lodestonePos = new CompoundTag();
+                lodestonePos.putInt("X", portalPos.getX());
+                lodestonePos.putInt("Y", portalPos.getY());
+                lodestonePos.putInt("Z", portalPos.getZ());
+                tag.put("LodestonePos", lodestonePos);
+                tag.putString("LodestoneDimension", hunterDim);
+                tag.putBoolean("LodestoneTracked", false);
+            } else if (!sameDim) {
+                // Tracked runner has never visited the hunter's dimension — spin
+                CompoundTag fakePos = new CompoundTag();
+                fakePos.putInt("X", 0); fakePos.putInt("Y", 0); fakePos.putInt("Z", 0);
+                tag.put("LodestonePos", fakePos);
+                tag.putString("LodestoneDimension", "manhunt:void");
+                tag.putBoolean("LodestoneTracked", false);
+            } else {
+                // Same dim, outside dead zone — track runner directly
+                BlockPos pos = runner.getBlockPos();
+                CompoundTag lodestonePos = new CompoundTag();
+                lodestonePos.putInt("X", pos.getX());
+                lodestonePos.putInt("Y", pos.getY());
+                lodestonePos.putInt("Z", pos.getZ());
+                tag.put("LodestonePos", lodestonePos);
+                tag.putString("LodestoneDimension", runnerDim);
+                tag.putBoolean("LodestoneTracked", false);
+            }
+        }
+
+        hunter.sendMessage(new LiteralText(actionBar), true);
+    }
+}
