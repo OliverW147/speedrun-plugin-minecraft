@@ -9,6 +9,8 @@ import net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents;
 import net.fabricmc.fabric.api.event.player.UseItemCallback;
 import net.minecraft.entity.boss.dragon.EnderDragonEntity;
 import net.minecraft.entity.boss.dragon.EnderDragonFight;
+import net.minecraft.entity.effect.StatusEffectInstance;
+import net.minecraft.entity.effect.StatusEffects;
 import net.minecraft.entity.player.PlayerEntity;
 import net.minecraft.item.ItemStack;
 import net.minecraft.item.Items;
@@ -60,6 +62,19 @@ public class ManhuntMod implements DedicatedServerModInitializer {
     // the server tick (NPE in ChunkTicketManager.updateCameraPosition). Wait a few ticks for it to settle.
     private static final Map<UUID, Integer> eliminationTick = new HashMap<>();
     private static final int RESPAWN_SETTLE_TICKS = 5;
+    // Tick at which a runner was first observed dead. isDead() is simply health <= 0, so it goes true
+    // on the very tick the killing blow lands — long before the client has processed the death sequence
+    // and shown its death screen. Force-respawning in that window makes the client and server disagree
+    // about which state the player is in, which is what left dead runners unable to respawn, move or be
+    // /kill'd. Vanilla instead waits for the client to ask (ClientStatusC2SPacket.PERFORM_RESPAWN); we
+    // approximate that by letting the death animation play out before respawning them.
+    private static final Map<UUID, Integer> deathSeenTick = new HashMap<>();
+    private static final int DEATH_SETTLE_TICKS = 20;
+    // Runners respawned-as-eliminated but not yet switched to spectator. Switching gamemode on the same
+    // tick as respawnPlayer races the client's packet decoder (respawn sends its own dimension/entity/
+    // inventory packets) and can corrupt the connection — same class of issue as the teleport-settle
+    // guard above. We wait RESPAWN_SETTLE_TICKS before flipping to SPECTATOR.
+    private static final Set<UUID> pendingSpectatorSwitch = new LinkedHashSet<>();
 
     // Per-hunter tracked runner. Absent (or value not in `runners`) = track nearest runner (default).
     // Toggled by right-clicking the compass, which cycles: nearest -> runner0 -> runner1 -> ... -> nearest.
@@ -101,10 +116,10 @@ public class ManhuntMod implements DedicatedServerModInitializer {
                     dragonKilledBaseline = fightAtStart != null && fightAtStart.hasPreviouslyKilled();
                     sawLiveDragon = false;
 
-                    // Freeze hunters
+                    // Freeze hunters immediately so they're locked from tick zero, not one tick late.
                     for (UUID id : hunters) {
                         ServerPlayerEntity h = server.getPlayerManager().getPlayer(id);
-                        if (h != null) h.setVelocity(0, 0, 0);
+                        if (h != null) applyFreezeEffects(h);
                     }
 
                     // Make sure runners start in survival (e.g. if a prior game left someone spectating).
@@ -272,12 +287,16 @@ public class ManhuntMod implements DedicatedServerModInitializer {
             if (graceTicksLeft > 0) {
                 graceTicksLeft--;
 
+                // Freeze hunters with status effects rather than by zeroing velocity every tick.
+                // Zeroing velocity server-side desyncs the client: a hunter who jumps hangs in mid-air
+                // with no downward motion and no block beneath them, which is exactly the condition
+                // ServerPlayNetworkHandler flags as "floating". After 80 such ticks it kicks them with
+                // multiplayer.disconnect.flying. Slowness 255 pins them in place, and Jump Boost 128
+                // (a large negative jump modifier) stops them leaving the ground in the first place,
+                // so the floating check never trips. Both are refreshed while grace is running.
                 for (UUID id : hunters) {
                     ServerPlayerEntity h = server.getPlayerManager().getPlayer(id);
-                    if (h != null) {
-                        h.setVelocity(0, 0, 0);
-                        h.velocityModified = true;
-                    }
+                    if (h != null) applyFreezeEffects(h);
                 }
 
                 // Countdown titles at 10, 5, 4, 3, 2, 1
@@ -293,6 +312,10 @@ public class ManhuntMod implements DedicatedServerModInitializer {
                 }
 
                 if (graceTicksLeft == 0) {
+                    for (UUID id : hunters) {
+                        ServerPlayerEntity h = server.getPlayerManager().getPlayer(id);
+                        if (h != null) clearFreezeEffects(h);
+                    }
                     broadcast(server, "§a§lGO! Hunters are released!");
                     broadcastTitle(server, "§a§lGO!");
                 }
@@ -344,8 +367,17 @@ public class ManhuntMod implements DedicatedServerModInitializer {
                     // Disconnected mid-game = treated as dead.
                     eliminatedRunners.add(id);
                     broadcast(server, "§c§l" + nameOf(server, id) + " disconnected — eliminated!");
+                } else if (!runner.isDead()) {
+                    deathSeenTick.remove(id); // alive again before the settle elapsed (e.g. totem/heal)
                 } else if (runner.isDead()) {
-                    eliminateRunner(server, runner);
+                    // Wait for the death to settle client-side before force-respawning (see deathSeenTick).
+                    int now = server.getTicks();
+                    Integer seen = deathSeenTick.get(id);
+                    if (seen == null) {
+                        deathSeenTick.put(id, now);
+                    } else if (now - seen >= DEATH_SETTLE_TICKS) {
+                        eliminateRunner(server, runner);
+                    }
                 }
             }
 
@@ -357,11 +389,22 @@ public class ManhuntMod implements DedicatedServerModInitializer {
                 return;
             }
 
+            // Flip respawned-eliminated runners to spectator once their respawn has settled. Doing this on
+            // the same tick as respawnPlayer races the client's packet decoder (see pendingSpectatorSwitch).
+            for (UUID id : new ArrayList<>(pendingSpectatorSwitch)) {
+                Integer elimTick = eliminationTick.get(id);
+                if (elimTick != null && server.getTicks() - elimTick < RESPAWN_SETTLE_TICKS) continue;
+                ServerPlayerEntity p = server.getPlayerManager().getPlayer(id);
+                if (p != null) p.setGameMode(GameMode.SPECTATOR);
+                pendingSpectatorSwitch.remove(id);
+            }
+
             // Keep eliminated (online) runners as spectators, locked to the lowest-index alive runner's dimension.
             ServerPlayerEntity anchor = lowestIndexAliveRunner(server);
             if (anchor != null) {
                 RegistryKey<World> anchorDim = anchor.world.getRegistryKey();
                 for (UUID id : eliminatedRunners) {
+                    if (pendingSpectatorSwitch.contains(id)) continue; // still settling from respawn
                     ServerPlayerEntity dead = server.getPlayerManager().getPlayer(id);
                     if (dead == null) continue;
                     if (dead.interactionManager.getGameMode() != GameMode.SPECTATOR) {
@@ -456,6 +499,22 @@ public class ManhuntMod implements DedicatedServerModInitializer {
         }
     }
 
+    // Grace-period freeze, applied as status effects instead of per-tick velocity zeroing.
+    // Slowness 255 removes walk speed; Jump Boost 128 is the wrap-around negative jump modifier that
+    // prevents jumping at all. Keeping hunters on the ground is what matters: the vanilla floating
+    // check kicks any non-spectator player who spends 80 ticks airborne without downward motion.
+    // Effects are re-applied each tick with a short duration so they expire on their own if the
+    // game ends abruptly (crash, /stop) and never linger on a player.
+    private void applyFreezeEffects(ServerPlayerEntity player) {
+        player.addStatusEffect(new StatusEffectInstance(StatusEffects.SLOWNESS, 40, 255, false, false, false));
+        player.addStatusEffect(new StatusEffectInstance(StatusEffects.JUMP_BOOST, 40, 128, false, false, false));
+    }
+
+    private void clearFreezeEffects(ServerPlayerEntity player) {
+        player.removeStatusEffect(StatusEffects.SLOWNESS);
+        player.removeStatusEffect(StatusEffects.JUMP_BOOST);
+    }
+
     private void endGame(MinecraftServer server, String message) {
         if (message != null) broadcast(server, message);
         gameRunning = false;
@@ -469,13 +528,18 @@ public class ManhuntMod implements DedicatedServerModInitializer {
         // Also clean up any tracker compasses left in hunters' inventories.
         for (UUID id : hunters) {
             ServerPlayerEntity p = server.getPlayerManager().getPlayer(id);
-            if (p != null) removeAllManhuntCompasses(p);
+            if (p != null) {
+                removeAllManhuntCompasses(p);
+                clearFreezeEffects(p); // grace may have been running when the game ended
+            }
         }
 
         hunters.clear();
         runners.clear();
         eliminatedRunners.clear();
         eliminationTick.clear();
+        deathSeenTick.clear();
+        pendingSpectatorSwitch.clear();
         pendingCompassRestore.clear();
         runnerPortalPositions.clear();
         runnerLastDimension.clear();
@@ -487,7 +551,17 @@ public class ManhuntMod implements DedicatedServerModInitializer {
 
     // Set a player to survival and send them to their spawn point (bed if set, else world spawn).
     private void restoreToSurvivalAtSpawn(MinecraftServer server, ServerPlayerEntity player) {
+        // A runner eliminated right as the game ended may still be dead and on the death screen (we
+        // delay the forced respawn by DEATH_SETTLE_TICKS). Flipping a dead player to survival would
+        // leave them stuck at 0 health with no way off that screen, so respawn them properly first and
+        // rebind the connection to the new entity, exactly as eliminateRunner does.
+        if (player.isDead()) {
+            ServerPlayerEntity respawned = server.getPlayerManager().respawnPlayer(player, false);
+            respawned.networkHandler.player = respawned;
+            player = respawned;
+        }
         player.setGameMode(GameMode.SURVIVAL);
+        clearFreezeEffects(player);
         ServerWorld targetWorld = null;
         BlockPos spawnPos = null;
         if (player.isSpawnPointSet() && player.getSpawnPointPosition() != null) {
@@ -614,9 +688,19 @@ public class ManhuntMod implements DedicatedServerModInitializer {
         UUID id = runner.getUuid();
         eliminatedRunners.add(id);
         broadcast(server, "§c§l" + runner.getName().getString() + " was caught!");
+
+        // respawnPlayer does NOT mutate the player in place: it removes the old entity from the player
+        // list and world and returns a brand new ServerPlayerEntity, moving the network handler over to
+        // it. Vanilla's own respawn path (ServerPlayNetworkHandler.onClientStatus) therefore does
+        // `this.player = respawnPlayer(...)`. Dropping the return value leaves networkHandler.player
+        // pointing at the old, removed corpse — the connection is bound to an entity that is no longer
+        // in the world, so the client sits on the death screen forever and movement, the respawn button
+        // and even /kill all act on a stale entity. Rebinding the handler is what unsticks them.
         ServerPlayerEntity respawned = server.getPlayerManager().respawnPlayer(runner, false);
-        respawned.setGameMode(GameMode.SPECTATOR);
+        respawned.networkHandler.player = respawned;
+
         eliminationTick.put(id, server.getTicks());
+        pendingSpectatorSwitch.add(id);
     }
 
     // Resolve which runner a hunter's compass should track this tick.
